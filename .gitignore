@@ -1,0 +1,77 @@
+# Secrets and environment files
+config.env
+.env
+.env.*
+*.env
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+
+# Virtual environments
+.venv/
+venv/
+venv311/
+venv*/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+site/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.hypothesis/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+publish_logs/
+
+# Media (large, not for git)
+media/clips/
+media/exports/
+media/previews/
+media/subtitles/
+
+# Transcription pipeline outputs
+pipeline/transcribe/output/
+pipeline/transcribe/subtitles/
+pipeline/transcribe/clips/
+
+# Generated reports and data
+raport.html
+raport_data.json
+kick/raport_kick.html
+kick/raport_kick_data.json
+
+# Databases and caches (runtime/generated)
+ensure_cache_progress.json
+
+
+# App-specific generated data
+transcribe/*.json
+transcribe/*.srt

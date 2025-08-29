@@ -1,0 +1,11 @@
+Flask==2.3.2
+gunicorn==21.2.0
+schedule==1.2.0
+APScheduler==3.10.4
+# Twitch API
+twitchAPI==3.1.0
+requests==2.31.0
+
+# jeśli w main.py lub update_streamers.py czytasz .env
+python-dotenv==1.0.0
+KickApi==0.3.5

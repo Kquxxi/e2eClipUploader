@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <title>Panel Twitch Clips</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Panel Twitch Clips</h1>
+      <div class="actions">
+        <button id="btn-update" class="btn">Odśwież streamerów twitch</button>
+        <button id="btn-report" class="btn">Generuj raport Twitch</button>
+        <button id="btn-kick" class="btn">Generuj raport Kick</button>
+        <span id="spinner" style="display:none;margin-left:8px;">⏳</span>
+        <div id="kick-report-container"></div>
+
+      </div>
+      <div id="status" class="status"></div>
+    </header>
+
+    <main id="raport-container"></main>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const raportContainer = document.getElementById('raport-container');
+    const btnReport = document.getElementById('btn-report');
+    const btnKick = document.getElementById('btn-kick');
+    const spinner = document.getElementById('spinner');
+
+    document.getElementById('btn-kick').onclick = async () => {
+      if (btnKick.disabled) return;
+      btnKick.disabled = true;
+      const prevTxt = btnKick.textContent;
+      btnKick.textContent = 'Generuję…';
+      spinner.style.display = 'inline-block';
+      try {
+        await fetch('/api/generate-raport-kick');
+        await pollKick();
+      } finally {
+        btnKick.disabled = false;
+        btnKick.textContent = prevTxt;
+        spinner.style.display = 'none';
+      }
+    };
+
+function pollKick() {
+  return fetch('/api/report-kick-ready')
+    .then(r => r.json())
+    .then(j => {
+      if (j.ready) {
+        return fetch('/raport-kick-fragment')
+          .then(r => r.text())
+          .then(html => {
+            const kc = document.getElementById('kick-report-container');
+            kc.innerHTML = html;
+            initReportFiltersAndStats(kc);
+          });
+      } else {
+        return new Promise(res => setTimeout(res, 2000)).then(() => pollKick());
+      }
+    });
+}
+
+    // 1) Odśwież streamerów
+    async function runUpdate() {
+      const btn = document.getElementById('btn-update');
+      if (btn.disabled) return;
+      btn.disabled = true;
+      const prev = btn.textContent;
+      btn.textContent = 'Odświeżam…';
+      statusEl.textContent = '🔄 Odświeżanie streamerów…';
+      try {
+        const res = await fetch('/api/update-streamers');
+        const obj = await res.json();
+        statusEl.textContent = obj.message || obj.error;
+      } catch (e) {
+        statusEl.textContent = 'Błąd: ' + e;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prev;
+      }
+    }
+
+    // 2) Generowanie raportu i pollowanie gotowości
+    async function runReport() {
+      const btn = btnReport;
+      if (btn.disabled) return;
+      btn.disabled = true;
+      const prev = btn.textContent;
+      btn.textContent = 'Generuję…';
+      statusEl.textContent = '🕒 Rozpoczynam generowanie…';
+      spinner.style.display = 'inline-block';
+      try {
+        await fetch('/api/generate-raport');
+        statusEl.textContent = '⌛ Czekam na raport…';
+        const poll = setInterval(async () => {
+          try {
+            const r = await fetch('/api/report-ready');
+            const { ready } = await r.json();
+            if (ready) {
+              clearInterval(poll);
+              statusEl.textContent = '✅ Raport gotowy!';
+              await loadReportFragment();
+              btn.disabled = false;
+              btn.textContent = prev;
+              spinner.style.display = 'none';
+            }
+          } catch (e) {
+            console.error(e);
+          }
+        }, 4000);
+      } catch (e) {
+        statusEl.textContent = 'Błąd: ' + e;
+        btn.disabled = false;
+        btn.textContent = prev;
+        spinner.style.display = 'none';
+      }
+    }
+
+    // 3) Pobranie i wstrzyknięcie fragmentu raportu
+    async function loadReportFragment() {
+      const html = await fetch('/raport-fragment').then(r => r.text());
+      raportContainer.innerHTML = html;
+      initReportFiltersAndStats(raportContainer);
+    }
+
+    // 4) Inicjalizacja dropdownów i aplikacja filtrów
+function initReportFiltersAndStats(root) {
+  if (!root) return;
+
+  // 1. Toggle dropdownów tylko wewnątrz root
+  root.querySelectorAll('.dropdown').forEach(dd => {
+    const btn = dd.querySelector('button');
+    if (btn) {
+      btn.addEventListener('click', () => {
+        dd.classList.toggle('open');
+      });
+    }
+  });
+
+  // 2. Pobierz wszystkie wiersze tabeli wewnątrz root
+  const rows = Array.from(root.querySelectorAll('#report-table tbody tr'));
+
+  // Czy w tym widoku istnieje filtrowanie po kategoriach?
+  const hasCategoryFiltering = root.querySelectorAll('.filter-category').length > 0;
+
+  // 3. Funkcja filtrująca + aktualizująca statystyki
+  function applyFiltersAndStats() {
+    // a) streamerzy
+    const ignoredStreamers = new Set(
+      Array.from(root.querySelectorAll('.filter-streamer'))
+        .filter(cb => !cb.checked).map(cb => cb.value)
+    );
+    // b) kategorie (opcjonalne)
+    const ignoredCategories = new Set(
+      hasCategoryFiltering
+        ? Array.from(root.querySelectorAll('.filter-category'))
+            .filter(cb => !cb.checked).map(cb => cb.value)
+        : []
+    );
+
+    const visible = [];
+    rows.forEach(row => {
+      const st = row.dataset.streamer;
+      const ct = row.dataset.category;
+      const hideByStreamer = ignoredStreamers.has(st);
+      const hideByCategory = hasCategoryFiltering ? ignoredCategories.has(ct) : false;
+      const hide = hideByStreamer || hideByCategory;
+      row.style.display = hide ? 'none' : '';
+      if (!hide) visible.push(row);
+    });
+
+    // c) oblicz statystyki
+    const total = visible.length;
+    const catCounts = {}, strCounts = {};
+    visible.forEach(r => {
+      const st = r.dataset.streamer;
+      strCounts[st] = (strCounts[st]||0)+1;
+      if (hasCategoryFiltering) {
+        const ct = r.dataset.category;
+        if (ct !== undefined) {
+          catCounts[ct] = (catCounts[ct]||0)+1;
+        }
+      }
+    });
+    const topCats = hasCategoryFiltering
+      ? Object.entries(catCounts).sort((a,b)=>b[1]-a[1]).slice(0,3)
+      : [];
+    const topStr = Object.entries(strCounts)
+      .sort((a,b)=>b[1]-a[1]).slice(0,3);
+
+    // d) wstaw do root, nie do document (i tylko jeśli elementy istnieją)
+    const totalEl = root.querySelector('#stats-total');
+    if (totalEl) totalEl.textContent = total;
+
+    const catsEl = root.querySelector('#stats-categories');
+    if (catsEl) catsEl.textContent = topCats.map(([c,n])=>`${c} (${n})`).join(', ');
+
+    const strEl = root.querySelector('#stats-streamers');
+    if (strEl) strEl.textContent = topStr.map(([s,n])=>`${s} (${n})`).join(', ');
+  }
+
+  // 4. Podłącz przyciski filtrów tylko wewnątrz root (z guardami)
+  const applyStreamersBtn = root.querySelector('#apply-streamers');
+  if (applyStreamersBtn) {
+    applyStreamersBtn.addEventListener('click', ()=>{
+      applyFiltersAndStats();
+      const ddS = root.querySelector('#dd-streamers');
+      if (ddS) ddS.classList.remove('open');
+    });
+  }
+
+  const applyCategoriesBtn = root.querySelector('#apply-categories');
+  if (applyCategoriesBtn) {
+    applyCategoriesBtn.addEventListener('click', ()=>{
+      applyFiltersAndStats();
+      const ddC = root.querySelector('#dd-categories');
+      if (ddC) ddC.classList.remove('open');
+    });
+  }
+
+  // 5. UI zaznaczania i przejścia do edytora (działa dla Twitch i Kick)
+  const proceedBtn = root.querySelector('#twitch-proceed-editor') || root.querySelector('#kick-proceed-editor');
+  const getCheckboxes = () => Array.from(root.querySelectorAll('.clip-select'));
+  const updateProceedState = () => {
+    if (proceedBtn) {
+      const anyChecked = getCheckboxes().some(cb => cb.checked);
+      proceedBtn.disabled = !anyChecked;
+    }
+  };
+  if (proceedBtn) {
+    root.addEventListener('change', (e) => {
+      if (e.target && e.target.classList && e.target.classList.contains('clip-select')) {
+        updateProceedState();
+      }
+    });
+    updateProceedState();
+    proceedBtn.addEventListener('click', (e)=>{
+      e.preventDefault();
+      if (proceedBtn.disabled) return;
+      const selected = getCheckboxes().filter(cb=>cb.checked).map(cb=>({
+        url: cb.dataset.url,
+        broadcaster: cb.dataset.broadcaster,
+        title: cb.dataset.title
+      }));
+      try {
+        // Zapisz lokalnie i przejdź do edytora. POST zrobimy na stronie edytora.
+        localStorage.setItem('pendingSelection', JSON.stringify({ clips: selected }));
+        window.location.assign('/editor');
+      } catch (e) {
+        alert('Nie udało się zapisać wyboru: ' + e);
+      }
+    });
+  }
+
+  // 6. Pierwsze wyliczenie
+  applyFiltersAndStats();
+}
+
+    // Podłączamy eventy do przycisków
+    document.getElementById('btn-update').addEventListener('click', runUpdate);
+    document.getElementById('btn-report').addEventListener('click', runReport);
+  </script>
+</body>
+</html>

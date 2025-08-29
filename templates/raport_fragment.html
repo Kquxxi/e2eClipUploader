@@ -1,0 +1,83 @@
+{# templates/raport_fragment.html #}
+<div id="twitch-report-root">
+<!-- Panel statystyk -->
+<div id="stats-panel" class="stats-panel">
+  <p>Łącznie klipów: <strong><span id="stats-total">{{ stats.total_clips }}</span></strong></p>
+  <p>Top 3 kategorie: <strong><span id="stats-categories">
+    {% for cat, cnt in stats.top_categories %}
+      {{ cat }} ({{ cnt }}){% if not loop.last %}, {% endif %}
+    {% endfor %}
+  </span></strong></p>
+  <p>Top 3 streamerzy: <strong><span id="stats-streamers">
+    {% for st, cnt in stats.top_streamers %}
+      {{ st }} ({{ cnt }}){% if not loop.last %}, {% endif %}
+    {% endfor %}
+  </span></strong></p>
+</div>
+
+<div class="filter-panel">
+  <div class="dropdown" id="dd-streamers">
+    <button type="button">Streamerzy ▼</button>
+    <div class="dropdown-list">
+      {% set streamers = clips | map(attribute='broadcaster') | unique | sort %}
+      {% for s in streamers %}
+        <label>
+          <input type="checkbox" class="filter-streamer" value="{{ s }}" checked>
+          {{ s }}
+        </label>
+      {% endfor %}
+      <button class="btn-apply" id="apply-streamers">Zastosuj</button>
+    </div>
+  </div>
+
+  <div class="dropdown" id="dd-categories">
+    <button type="button">Kategorie ▼</button>
+    <div class="dropdown-list">
+      {% set cats = clips | map(attribute='category') | unique | sort %}
+      {% for c in cats %}
+        <label>
+          <input type="checkbox" class="filter-category" value="{{ c }}" checked>
+          {{ c }}
+        </label>
+      {% endfor %}
+      <button class="btn-apply" id="apply-categories">Zastosuj</button>
+    </div>
+  </div>
+</div>
+
+<div style="margin: 8px 0;">
+  <button id="twitch-proceed-editor" class="btn" disabled>➡️ Dalej do edytora (wybrane)</button>
+</div>
+
+<table id="report-table">
+  <thead>
+    <tr>
+      <th>Wybierz</th>
+      <th>Streamer</th>
+      <th>Tytuł</th>
+      <th>Wyświetlenia</th>
+      <th>Czas</th>
+      <th>Kategoria</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for c in clips %}
+    <tr data-streamer="{{ c.broadcaster }}" data-category="{{ c.category }}">
+      <td>
+        <input type="checkbox" class="clip-select" data-url="{{ c.url }}" data-broadcaster="{{ c.broadcaster }}" data-title="{{ c.title }}">
+      </td>
+      <td>{{ c.broadcaster }}</td>
+      <td>
+        <a href="{{ c.url }}" target="_blank" title="{{ c.title }}">
+          {%- set t = c.title -%}
+          {{ t[:40] }}{{ '…' if t|length > 40 else '' }}
+        </a>
+      </td>
+      <td>{{ c.views }}</td>
+      <td>{{ c.relative_time }}</td>
+      <td>{{ c.category }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <title>Raport Kick (ostatnie 24h)</title>
+</head>
+<body>
+  <h1>Raport Kick (ostatnie 24h)</h1>
+  <p><strong>Łączna liczba klipów:</strong> {{ stats.total_clips }}</p>
+  <hr>
+  <ul>
+  {% for clip in clips %}
+    <li>
+      <strong>{{ clip.broadcaster }}</strong> –
+      <a href="{{ clip.url }}" target="_blank">{{ clip.title }}</a>
+      ({{ clip.views }} wyświetleń, {{ clip.relative_time }})<br>
+      <img src="{{ clip.thumbnail }}" width="200" alt="miniaturka">
+    </li>
+  {% endfor %}
+  </ul>
+</body>
+</html>

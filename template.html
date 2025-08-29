@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Raport klipów polskich streamerów</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    .summary p { margin: .2rem 0; }
+    .summary h3 { margin-top: 1rem; }
+    ul { list-style: none; padding: 0; }
+    li { margin: .5rem 0; }
+    small { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Raport klipów polskich streamerów (ostatnie 24h)</h1>
+
+  <section class="summary">
+    <p><strong>Liczba znalezionych klipów:</strong> {{ stats.total_clips }}</p>
+
+    <h3>Top 3 kategorie:</h3>
+    <ol>
+      {% for category, count in stats.top_categories %}
+        <li>{{ category }} ({{ count }} klipów)</li>
+      {% endfor %}
+    </ol>
+
+    <h3>Top 3 streamerzy:</h3>
+    <ol>
+      {% for broadcaster, count in stats.top_streamers %}
+        <li>{{ broadcaster }} ({{ count }} klipów)</li>
+      {% endfor %}
+    </ol>
+  </section>
+
+  <hr>
+
+  <h2>Lista klipów</h2>
+  <ul>
+    {% for clip in clips %}
+      <li>
+        <strong>{{ clip.broadcaster }}</strong> –
+        <a href="{{ clip.url }}" target="_blank">{{ clip.title }}</a>
+        <em>({{ clip.category }})</em> –
+        {{ clip.views }} wyświetleń
+        <small>({{ clip.relative_time }})</small>
+      </li>
+    {% endfor %}
+  </ul>
+</body>
+</html>
