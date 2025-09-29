@@ -2,7 +2,7 @@ import sys
 import os
 import subprocess
 import json
-from flask import Flask, render_template, jsonify, send_file, request
+from flask import Flask, render_template, jsonify, send_file, request, Response, make_response
 from subprocess import CalledProcessError
 # --- new imports for local parity ---
 from dotenv import load_dotenv
@@ -17,6 +17,7 @@ import requests
 import datetime
 import time
 import uuid
+import re
 
 
 app = Flask(
@@ -193,7 +194,15 @@ def api_selection():
 def editor():
     sel = _safe_read_json(get_data_path('selection.json'), default={'clips': []})
     clips = sel.get('clips', [])
-    return render_template('editor.html', clips=clips)
+    resp = make_response(render_template('editor.html', clips=clips))
+    try:
+        resp.headers['Cache-Control'] = 'no-store'
+        resp.headers['Pragma'] = 'no-cache'
+        resp.headers['Expires'] = '0'
+        resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+    except Exception:
+        pass
+    return resp
 
 # --- NEW: helpers for downloader/preview ---
 def _clip_id_from_url(url: str) -> str:
@@ -217,16 +226,52 @@ def _download_with_ytdlp(url: str, out_path: str):
     # Spróbuj znaleźć yt-dlp w PATH, a jeśli brak, użyj "python -m yt_dlp"
     ytdlp = shutil.which('yt-dlp') or shutil.which('yt-dlp.exe')
     tmp = out_path + '.part'
+    # Przygotuj bazowe polecenie, aby móc dołożyć parametry specyficzne dla domeny
     if ytdlp:
-        cmd = [ytdlp, '-o', tmp, url]
+        cmd_base = [ytdlp]
     else:
         # fallback: modułowa forma przez aktualnego Pythona
-        cmd = [sys.executable, '-m', 'yt_dlp', '-o', tmp, url]
+        cmd_base = [sys.executable, '-m', 'yt_dlp']
+
+    extra_args = []
+    try:
+        # Kick wprowadził ostrzejszą ochronę (403/Cloudflare) – wymagane cookies i realne nagłówki
+        if ('kick.com' in (url or '')) or ('stream.kick.com' in (url or '')):
+            # 1) Preferowane: pobierz cookies z przeglądarki (np. chrome / edge / firefox)
+            browser = os.getenv('KICK_COOKIES_FROM_BROWSER')
+            if browser:
+                extra_args += ['--cookies-from-browser', browser]
+                print(f"[yt-dlp] Kick: używam cookies z przeglądarki: {browser}")
+            else:
+                # Alternatywa: ścieżka do pliku cookies w formacie Netscape
+                cookies_file = os.getenv('KICK_COOKIES_FILE')
+                if cookies_file and os.path.isfile(cookies_file):
+                    extra_args += ['--cookies', cookies_file]
+                    print(f"[yt-dlp] Kick: używam cookies z pliku: {cookies_file}")
+
+            # 2) Dodaj referer + realny UA i kilka bezpiecznych nagłówków
+            referer = url
+            ua = os.getenv('KICK_USER_AGENT') or (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/125.0.0.0 Safari/537.36'
+            )
+            extra_args += [
+                '--referer', referer,
+                '--add-header', f'User-Agent: {ua}',
+                '--add-header', 'Origin: https://kick.com',
+                '--add-header', 'Accept-Language: en-US,en;q=0.9'
+            ]
+    except Exception as _e:
+        # Nie przerywaj – najwyżej pobieranie nie powiedzie się jak wcześniej
+        print(f"[yt-dlp] Kick headers/cookies build failed: {type(_e).__name__}: {_e}")
+
+    cmd = cmd_base + extra_args + ['-o', tmp, url]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             # jeśli fallback z modułem i nie ma pakietu, podaj czytelny komunikat
-            if not ytdlp and ('No module named' in (res.stderr or '') and 'yt_dlp' in (res.stderr or '')):
+            if (cmd_base[:2] == [sys.executable, '-m']) and ('No module named' in (res.stderr or '') and 'yt_dlp' in (res.stderr or '')):
                 return False, 'yt-dlp not found. Install with: pip install yt-dlp'
             return False, (res.stderr or res.stdout or 'yt-dlp failed')
         # yt-dlp może zapisać dokładnie tmp lub tmp+ext — obsłuż obie opcje
@@ -371,19 +416,139 @@ def api_ensure_cache():
 
 # --- MEDIA SERVE ENDPOINTS + CROP API ---------------------
 
-@app.route('/media/previews/<path:name>')
+@app.route('/media/previews/<path:name>', methods=['GET','HEAD'])
 def serve_preview(name: str):
     path = get_data_path('media', 'previews', name)
     if not os.path.exists(path):
-        return jsonify({'error': 'Not Found'}), 404
-    return send_file(path)
+        resp = jsonify({'error': 'Not Found'})
+        resp.status_code = 404
+        resp.headers['Cache-Control'] = 'no-store'
+        resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+        return resp
+    return _send_file_partial(path)
 
-@app.route('/media/clips/<path:name>')
+@app.route('/media/clips/<path:name>', methods=['GET','HEAD'])
 def serve_clip(name: str):
     path = get_data_path('media', 'clips', name)
     if not os.path.exists(path):
-        return jsonify({'error': 'Not Found'}), 404
-    return send_file(path)
+        resp = jsonify({'error': 'Not Found'})
+        resp.status_code = 404
+        resp.headers['Cache-Control'] = 'no-store'
+        resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+        return resp
+    return _send_file_partial(path)
+
+# --- helper: partial content streaming for video ---
+def _send_file_partial(path: str):
+    try:
+        range_header = request.headers.get('Range')
+    except Exception:
+        range_header = None
+    try:
+        method = request.method
+    except Exception:
+        method = 'GET'
+    size = os.path.getsize(path)
+    try:
+        print(f'[media] {method} {path} Range={range_header}')
+    except Exception:
+        pass
+    # Brak nagłówka Range
+    if not range_header:
+        if method == 'HEAD':
+            resp = Response(status=200)
+            resp.headers['Content-Type'] = 'video/mp4'
+            resp.headers['Content-Length'] = str(size)
+            resp.headers['Accept-Ranges'] = 'bytes'
+            resp.headers['Cache-Control'] = 'no-transform, public, max-age=0'
+            resp.headers['Content-Disposition'] = 'inline; filename="video.mp4"'
+            resp.headers['X-Accel-Buffering'] = 'no'
+            resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+            return resp
+        resp = send_file(path, mimetype='video/mp4')
+        resp.headers['Accept-Ranges'] = 'bytes'
+        resp.headers['Cache-Control'] = 'no-transform, public, max-age=0'
+        resp.headers['Content-Disposition'] = 'inline; filename="video.mp4"'
+        resp.headers['X-Accel-Buffering'] = 'no'
+        resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+        return resp
+    # Obsługa Range
+    m = re.match(r'bytes=(\d+)-(\d*)', range_header)
+    if not m:
+        # obsługa sufiksowego zakresu: bytes=-N
+        m_suffix = re.match(r'bytes=-(\d+)', range_header)
+        if not m_suffix:
+            # nierozpoznany format Range – fallback
+            if method == 'HEAD':
+                resp = Response(status=200)
+                resp.headers['Content-Type'] = 'video/mp4'
+                resp.headers['Content-Length'] = str(size)
+                resp.headers['Accept-Ranges'] = 'bytes'
+                resp.headers['Cache-Control'] = 'no-transform, public, max-age=0'
+                resp.headers['Content-Disposition'] = 'inline; filename="video.mp4"'
+                resp.headers['X-Accel-Buffering'] = 'no'
+                resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+                return resp
+            resp = send_file(path, mimetype='video/mp4')
+            resp.headers['Accept-Ranges'] = 'bytes'
+            resp.headers['Cache-Control'] = 'no-transform, public, max-age=0'
+            resp.headers['Content-Disposition'] = 'inline; filename="video.mp4"'
+            resp.headers['X-Accel-Buffering'] = 'no'
+            resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+            return resp
+        # przetwarzanie sufiksowego zakresu
+        suffix_len = int(m_suffix.group(1))
+        suffix_len = min(suffix_len, size)
+        start = size - suffix_len
+        end = size - 1
+    else:
+        start = int(m.group(1))
+        end_s = m.group(2)
+        end = int(end_s) if end_s else size - 1
+    end = min(end, size - 1)
+    if start > end or start >= size:
+        # nieprawidłowy zakres: 416 Range Not Satisfiable
+        resp = Response(status=416)
+        resp.headers['Content-Range'] = f'bytes */{size}'
+        resp.headers['Accept-Ranges'] = 'bytes'
+        resp.headers['Cache-Control'] = 'no-store, no-transform, max-age=0'
+        resp.headers['Content-Type'] = 'video/mp4'
+        resp.headers['Content-Disposition'] = 'inline; filename="video.mp4"'
+        resp.headers['X-Accel-Buffering'] = 'no'
+        resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+        return resp
+    length = end - start + 1
+    if method == 'HEAD':
+        rv = Response(status=206)
+        rv.headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+        rv.headers['Accept-Ranges'] = 'bytes'
+        rv.headers['Content-Length'] = str(length)
+        rv.headers['Cache-Control'] = 'no-transform, public, max-age=0'
+        rv.headers['Content-Type'] = 'video/mp4'
+        rv.headers['Content-Disposition'] = 'inline; filename="video.mp4"'
+        rv.headers['X-Accel-Buffering'] = 'no'
+        rv.headers['X-Robots-Tag'] = 'noindex, nofollow'
+        return rv
+    def generate():
+        with open(path, 'rb') as f:
+            f.seek(start)
+            remaining = length
+            chunk = 1024 * 1024
+            while remaining > 0:
+                data = f.read(min(chunk, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+    rv = Response(generate(), 206, mimetype='video/mp4', direct_passthrough=True)
+    rv.headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+    rv.headers['Accept-Ranges'] = 'bytes'
+    rv.headers['Content-Length'] = str(length)
+    rv.headers['Cache-Control'] = 'no-transform, public, max-age=0'
+    rv.headers['Content-Disposition'] = 'inline; filename="video.mp4"'
+    rv.headers['X-Accel-Buffering'] = 'no'
+    rv.headers['X-Robots-Tag'] = 'noindex, nofollow'
+    return rv
 
 # NEW: serve rendered exports
 @app.route('/media/exports/<path:name>')

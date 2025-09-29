@@ -196,7 +196,7 @@
        });
      }
  
-     function selectClip(c){
+     async function selectClip(c){
        active = { ...c, clip_id: clipIdFromUrl(c.url) };
        window.active = active;
        renderList();
@@ -205,6 +205,17 @@
          state.cameraRect = j.camera || null;
          updateBothVisuals();
        }).catch(()=>{});
+       // Preflight: sprawdź czy pliki istnieją; jeśli nie, odpal ensure-cache i poczekaj
+       try {
+         const headPrev = await fetch(`/media/previews/${active.clip_id}.mp4`, { method: 'HEAD', cache: 'no-store' });
+         const headOrig = await fetch(`/media/clips/${active.clip_id}.mp4`, { method: 'HEAD', cache: 'no-store' });
+         if (!headPrev.ok && !headOrig.ok) {
+           dlWrap.hidden = false;
+           dlText.textContent = 'Pobieranie brakujących plików...';
+           dlBar.style.width = '0%';
+           await ensureCacheWithProgress(clips.length);
+         }
+       } catch (e) { /* ignore */ }
        tryAutoLoadActive();
        video.addEventListener('loadedmetadata', updateBothVisuals, { once: true });
      }
@@ -215,34 +226,36 @@
      }
  
      function tryAutoLoadActive(){
-       if (!active) return;
-       const previewUrl = `/media/previews/${active.clip_id}.mp4`;
-       const origUrl = `/media/clips/${active.clip_id}.mp4`;
-       const onErrorOnce = ()=>{
-         video.removeEventListener('error', onErrorOnce);
-         // fallback do oryginału
-         setVideo(origUrl);
-         const onErr2 = ()=>{
-           video.removeEventListener('error', onErr2);
-           setInfo('Nie udało się załadować pliku wideo (prewka ani oryginał).', true);
-         };
-         video.addEventListener('error', onErr2, { once: true });
-       };
-       video.addEventListener('error', onErrorOnce, { once: true });
-       setVideo(previewUrl);
-     }
+      if (!active) return;
+      // jeśli trwa ensure-cache (pasek widoczny), wstrzymaj auto-ładowanie do czasu zakończenia
+      if (typeof dlWrap !== 'undefined' && dlWrap && !dlWrap.hidden) return;
+      const previewUrl = `/media/previews/${active.clip_id}.mp4?v=${Date.now()}`;
+      const origUrl = `/media/clips/${active.clip_id}.mp4?v=${Date.now()}`;
+      const onErrorOnce = ()=>{
+        video.removeEventListener('error', onErrorOnce);
+        // fallback do oryginału
+        setVideo(origUrl);
+        const onErr2 = ()=>{
+          video.removeEventListener('error', onErr2);
+          setInfo('Nie udało się załadować pliku wideo (prewka ani oryginał).', true);
+        };
+        video.addEventListener('error', onErr2, { once: true });
+      };
+      video.addEventListener('error', onErrorOnce, { once: true });
+      setVideo(previewUrl);
+    }
  
    // Przyciski wyboru ÅºrÅ³ła odtwarzania
       const btnPrev = document.getElementById('btn-load-preview');
       const btnSrc = document.getElementById('btn-load-source');
       btnPrev.addEventListener('click', ()=>{
         if (!active) { alert('Najpierw wybierz klip.'); return; }
-        const url = `/media/previews/${active.clip_id}.mp4`;
+        const url = `/media/previews/${active.clip_id}.mp4?v=${Date.now()}`;
         setVideo(url);
       });
       btnSrc.addEventListener('click', ()=>{
         if (!active) { alert('Najpierw wybierz klip.'); return; }
-        const url = `/media/clips/${active.clip_id}.mp4`;
+        const url = `/media/clips/${active.clip_id}.mp4?v=${Date.now()}`;
         setVideo(url);
       });
  
@@ -488,14 +501,15 @@ if (onlyVertical) {
        if (ensureErrorMessage) {
          dlText.textContent = 'Błąd';
          setInfo('Błąd pobierania: ' + ensureErrorMessage, true);
+         // Nie blokuj UI – pozwól użytkownikowi spróbować odtwarzania lub ponowić, ale schowaj pasek
+         dlWrap.hidden = true;
          return;
        }
-  
+ 
        dlText.textContent = 'Zakończono';
        dlBar.style.width = '100%';
-       setTimeout(()=>{ dlWrap.hidden = true; }, 800);
-  
-       tryAutoLoadActive();
+       dlWrap.hidden = true;
+ 
        setInfo('Gotowe. Możesz odtwarzać i kadrować klipy.');
      }
  
@@ -542,10 +556,10 @@ if (onlyVertical) {
            setInfo('Brak wybranych klipów. Wróć do raportu i zaznacz klipy.', true);
            return;
          }
-         // auto-select pierwszego
+         // automatycznie zacznij pobieranie + prewki zanim odtworzymy pierwszy klip
+         await ensureCacheWithProgress(clips.length);
+         // auto-select pierwszego po przygotowaniu
          selectClip(clips[0]);
-         // automatycznie zacznij pobieranie + prewki
-         ensureCacheWithProgress(clips.length);
        } catch(e) {
          console.error(e);
          setInfo('Wystąpił błąd inicjalizacji edytora: ' + e.message, true);
@@ -764,8 +778,8 @@ if (onlyVertical) {
     if (btnTranscribe) btnTranscribe.addEventListener('click', startTranscribe);
 
     const _origSelectClip = window.selectClip;
-    window.selectClip = function(c){
-      _origSelectClip(c);
+    window.selectClip = async function(c){
+      await _origSelectClip(c);
       resetSrtUi();
       // Resetuj status karaoke po zmianie klipu
       try {
