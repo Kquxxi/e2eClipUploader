@@ -45,8 +45,8 @@ def _safe_write_json(path: str, obj):
     os.replace(tmp, path)
 # --- end helpers ---
 
-# Wczytaj cache klipów
-with open(get_data_path('kick', 'kick_clips_cache.json'), encoding='utf-8') as f:
+# Wczytaj cache klipów (toleruj BOM)
+with open(get_data_path('kick', 'kick_clips_cache.json'), encoding='utf-8-sig') as f:
     all_clips = json.load(f)
 
 now = datetime.now(timezone.utc)

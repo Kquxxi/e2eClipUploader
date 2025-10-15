@@ -18,11 +18,42 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # --- Twitch filters from ENV ---
 TWITCH_WINDOW_HOURS = int(os.getenv('TWITCH_WINDOW_HOURS', '24'))
 TWITCH_MIN_VIEWS = int(os.getenv('TWITCH_MIN_VIEWS', '30'))
+# --- REQUEST/WORKERS CONFIG ---
+REQUEST_TIMEOUT = int(os.getenv('TWITCH_REQUEST_TIMEOUT', '20'))
+RAPORT_MAX_WORKERS = int(os.getenv('RAPORT_MAX_WORKERS', '5'))
+TWITCH_REPORT_MAX_STREAMERS = int(os.getenv('TWITCH_REPORT_MAX_STREAMERS', '0'))
 
 def get_data_path(*parts: str) -> str:
     return os.path.join(DATA_DIR, *parts)
 
 # --- safe atomic write helpers ---
+def _atomic_replace(tmp_path: str, final_path: str, retries: int = 20, delay_sec: float = 0.1) -> bool:
+    for _ in range(retries):
+        try:
+            os.replace(tmp_path, final_path)
+            return True
+        except (PermissionError, OSError):
+            # Na Windows pliki mogą być chwilowo zablokowane przez inny proces (czytnik), odczekaj i spróbuj ponownie
+            time.sleep(delay_sec)
+    # Ostatnia próba: spróbuj zapisać bezpośrednio do docelowego pliku i usunąć tmp
+    try:
+        with open(tmp_path, 'r', encoding='utf-8') as tf:
+            content = tf.read()
+        with open(final_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.remove(tmp_path)
+        return True
+    except Exception as e:
+        print(f"[WARN] Nie można zastąpić {final_path}: {e}")
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
 def _safe_write_text(path: str, text: str):
     # ensure directory exists
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
@@ -31,18 +62,28 @@ def _safe_write_text(path: str, text: str):
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    _atomic_replace(tmp, path)
+
 
 
 def _safe_write_json(path: str, obj):
     # ensure directory exists
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        _atomic_replace(tmp, path)
+    except Exception as e:
+        # Nie przerywaj całego procesu raportu jeśli zapis progresu nie powiedzie się chwilowo
+        print(f"[WARN] Problem z zapisem {path}: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 # --- end helpers ---
 CLIENT_ID     = os.getenv("TWITCH_CLIENT_ID")
 CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
@@ -65,7 +106,7 @@ def get_token():
         'client_secret': client_secret,
         'grant_type': 'client_credentials'
     }
-    res = requests.post(url, params=params)
+    res = requests.post(url, params=params, timeout=REQUEST_TIMEOUT)
     response_json = res.json()
     if 'access_token' not in response_json:
         # wyświetlamy całą odpowiedź do debugowania
@@ -81,7 +122,7 @@ def get_user_id(username, token):
     }
     url = f"https://api.twitch.tv/helix/users?login={username}"
     try:
-        resp = session.get(url, headers=headers)
+        resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         data = resp.json()
     except Exception as e:
         print("Błąd pobierania user_id:", e)
@@ -105,7 +146,7 @@ def get_clips(user_id, token):
     )
 
     try:
-        resp = session.get(url, headers=headers)
+        resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         res = resp.json()
     except Exception as e:
         print("Błąd pobierania klipów:", e)
@@ -117,20 +158,42 @@ def get_clips(user_id, token):
 
     return [c for c in res['data'] if c.get('view_count', 0) >= TWITCH_MIN_VIEWS]
 
+# Ensure reports/twitch directory exists for organized artifacts
+os.makedirs(get_data_path('reports', 'twitch'), exist_ok=True)
+def _append_event(kind: str, name: str):
+    try:
+        # write to organized location only
+        path_new = get_data_path('reports', 'twitch', 'events.log')
+        with open(path_new, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({
+                'event': kind,
+                'name': name,
+                'ts': datetime.now(timezone.utc).isoformat()
+            }) + "\n")
+    except Exception:
+        pass
+
+
+def get_clips_instrumented(user_id, display_name, token):
+    _append_event('start', display_name)
+    try:
+        return get_clips(user_id, token)
+    finally:
+        _append_event('done', display_name)
 
 # Generuj raport HTML
 def generate_raport(clips,stats):
     env = Environment(loader=FileSystemLoader(PROJECT_ROOT))
     template = env.get_template('template.html')
     html_output = template.render(clips=clips, stats=stats)
-    out_path = get_data_path('raport.html')
-    _safe_write_text(out_path, html_output)
+    # write organized report file
+    _safe_write_text(get_data_path('reports', 'twitch', 'raport.html'), html_output)
 
 def get_games_info(game_ids, token):
     headers = {'Client-ID': client_id, 'Authorization': f'Bearer {token}'}
     params  = [('id', gid) for gid in game_ids]
     try:
-        resp = session.get("https://api.twitch.tv/helix/games", headers=headers, params=params)
+        resp = session.get("https://api.twitch.tv/helix/games", headers=headers, params=params, timeout=REQUEST_TIMEOUT)
         res = resp.json()
     except Exception as e:
         print("Błąd pobierania kategorii gier:", e)
@@ -157,36 +220,62 @@ if __name__ == "__main__":
         print(f"[ERROR] Nie udało się wczytać bazy {db_file}: {e}")
         streamers = []
 
-    #print(f"[DEBUG] Załadowano {len(streamers)} streamerów")
+    # Limit liczby streamerów do raportu jeśli ustawiono ENV (dla szybkich testów)
+    if TWITCH_REPORT_MAX_STREAMERS > 0:
+        streamers = streamers[:TWITCH_REPORT_MAX_STREAMERS]
+        print(f"[raport] Ograniczono liczbę streamerów do {len(streamers)} na potrzeby raportu")
 
-max_workers = max(1, min(5, len(streamers)))  # co najmniej 1 wątek, by nie wywalić ThreadPoolExecutor
-all_clips = []
-
-with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-    future_to_streamer = {
-        executor.submit(get_clips, s['id'], token): s
-        for s in streamers
+    progress = {
+        'status': 'running',
+        'total': len(streamers),
+        'processed': 0,
+        'last_completed': None,
+        'updated_at': datetime.now(timezone.utc).isoformat()
     }
+    _safe_write_json(get_data_path('reports', 'twitch', 'progress.json'), progress)
 
-    for future in as_completed(future_to_streamer):
-        s = future_to_streamer[future]
-        try:
-            clips = future.result()
-        except Exception as e:
-            print(f"[ERROR] Błąd dla {s['display_name']}: {e}")
-            continue
+    max_workers = max(1, min(RAPORT_MAX_WORKERS, len(streamers)))
+    all_clips = []
+    print(f"[raport] Startuję ThreadPool z {max_workers} workerami dla {len(streamers)} streamerów")
 
-        #print(f"[DEBUG] -> {len(clips)} klipow dla {s['display_name']}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_streamer = {
+            executor.submit(get_clips_instrumented, s['id'], s['display_name'], token): s
+            for s in streamers
+        }
 
-        for clip in clips:
-            all_clips.append({
-                'broadcaster':  s['display_name'],
-                'title':        clip.get('title', '—'),
-                'url':          clip['url'],
-                'views':        clip['view_count'],
-                'game_id':      clip.get('game_id', ''),
-                'created_at':   clip.get('created_at')
-            })
+        processed = 0
+        total = len(future_to_streamer)
+        for future in as_completed(future_to_streamer):
+            s = future_to_streamer[future]
+            try:
+                clips = future.result()
+            except Exception as e:
+                print(f"[ERROR] Błąd dla {s['display_name']}: {e}")
+                clips = []
+
+            processed += 1
+            if processed % 20 == 0 or processed == total:
+                print(f"[raport] Postęp: {processed}/{total} streamerów przetworzonych")
+            progress['processed'] = processed
+            progress['last_completed'] = s['display_name']
+            progress['updated_at'] = datetime.now(timezone.utc).isoformat()
+            # write progress ONLY to organized location
+            _safe_write_json(get_data_path('reports', 'twitch', 'progress.json'), progress)
+
+            for clip in clips:
+                all_clips.append({
+                    'broadcaster':  s['display_name'],
+                    'title':        clip.get('title', '—'),
+                    'url':          clip['url'],
+                    'views':        clip['view_count'],
+                    'game_id':      clip.get('game_id', ''),
+                    'created_at':   clip.get('created_at')
+                })
+
+    progress['status'] = 'finished'
+    progress['updated_at'] = datetime.now(timezone.utc).isoformat()
+    _safe_write_json(get_data_path('reports', 'twitch', 'progress.json'), progress)
 
 #print(f"[DEBUG] Razem wyfiltrowanych klipow: {len(all_clips)}")
 
@@ -236,8 +325,8 @@ stats = {
 }
 
 # Najpierw zapisz dane JSON atomowo, potem wygeneruj HTML
-_safe_write_json(get_data_path('raport_data.json'), {'clips': sorted_clips, 'stats': stats})
+_safe_write_json(get_data_path('reports','twitch','raport_data.json'), {'clips': sorted_clips, 'stats': stats})
 
 # Generuj raport HTML (dla /raport)
 generate_raport(sorted_clips, stats)
-print("Raport został wygenerowany do pliku raport.html!")
+print("Raport został wygenerowany do pliku reports/twitch/raport.html!")

@@ -68,7 +68,13 @@
     <div class="layout">
       <aside class="sidebar">
         <h3>Wybrane klipy</h3>
+        
         <ul id="clip-list"></ul>
+        <div style="margin-top:12px; display:flex; gap:6px;">
+          <input id="add-url-input" type="url" placeholder="Wklej link do klipu (Twitch/Kick)" style="flex:1;">
+          <button id="btn-add-url" class="btn" type="button">➕ Dodaj</button>
+        </div>
+        <div class="hint">Obsługiwane: clips.twitch.tv, twitch.tv/.../clip/..., kick.com/[kanał]/clips/[id]</div>
       </aside>
       <section class="player">
         <div class="toolbar">
@@ -83,6 +89,7 @@
           <span id="ratio-display" class="ratio-label">70% gra / 30% kamerka</span>
         </div>
         <div class="snap-control"><label><input type="checkbox" id="auto-split-toggle"> Auto podział (wg aspektów zaznaczeń)</label></div>
+        <div class="snap-control"><label><input type="checkbox" id="single-frame-toggle"> Tryb jednego kadru</label> <span style="margin-left:8px; display:none;" id="single-frame-controls"><span>Wysokość sekcji:</span> <input type="range" id="single-height-slider" min="10" max="100" value="40" step="5"> <span id="single-height-display">40%</span></span></div>
         <div class="hint" id="crop-hint">Kliknij „Zaznacz kadry”, następnie: przeciągnij po pustym miejscu aby narysować. Przeciągnij wewnątrz aby przesunąć. Chwyć za krawędź/rogowy uchwyt aby zmienić rozmiar. Shift podczas rysowania = kamerka.</div>
          <div class="canvas-wrap">
            <video id="video" controls style="width:100%; max-width:960px; background:#000;"></video>
@@ -135,16 +142,36 @@
     const dlText = document.getElementById('dl-text');
     const dlCount = document.getElementById('dl-count');
     const overlay = document.getElementById('overlay');
+    const singleToggle = document.getElementById('single-frame-toggle');
+    const singleHeightSlider = document.getElementById('single-height-slider');
+    const singleHeightDisplay = document.getElementById('single-height-display');
+
     
-    // --- Nowy stan dwóch kadrów ---
+    // --- Stan edytora (tryb dwóch kadrów oraz jednego kadru) ---
     const state = { 
-      gameRect: null,    // {x,y,w,h} w współrzędnych [0..1]
-      cameraRect: null,  // {x,y,w,h} w współrzędnych [0..1]
+      gameRect: null,    // {x,y,w,h} w [0..1]
+      cameraRect: null,  // {x,y,w,h} w [0..1]
       gameRatio: 0.7,    // 70% wysokości dla gry
       validAspect: true, // czy aktualne kadry dają 9:16
       dragging: null,    // 'game' | 'camera' | null
-      autoSplit: false   // gdy true – wysokości sekcji liczymy z aspektów zaznaczeń
+      autoSplit: false,  // gdy true – wysokości sekcji liczymy z aspektów zaznaczeń
+      singleFrame: false,
+      singleHeightRatio: 0.4,
+      hideViewed: true
     };
+
+    // Persistencja obejrzanych klipów
+    let viewedSet = new Set();
+    try { viewedSet = new Set(JSON.parse(localStorage.getItem('viewedClips')||'[]').filter(x=>typeof x==='string')); } catch(e){ viewedSet = new Set(); }
+    try { state.hideViewed = JSON.parse(localStorage.getItem('hideViewed')||'true'); } catch(e){ /* keep default */ }
+
+    function markViewed(id){
+      if (!id) return;
+      if (!viewedSet.has(id)){
+        viewedSet.add(id);
+        try { localStorage.setItem('viewedClips', JSON.stringify(Array.from(viewedSet))); } catch(e){}
+      }
+    }
     
     // Suwak podziału pionowego
     ratioSlider.addEventListener('input', ()=>{
@@ -164,9 +191,33 @@
         validateAndUpdateVisuals();
       });
     }
+    if (singleToggle){
+      singleToggle.addEventListener('change', ()=>{
+        state.singleFrame = !!singleToggle.checked;
+        const controls = document.getElementById('single-frame-controls');
+        if (controls) controls.style.display = state.singleFrame ? 'inline-flex' : 'none';
+        validateAndUpdateVisuals();
+      });
+    }
+    if (singleHeightSlider){
+      singleHeightSlider.addEventListener('input', ()=>{
+        state.singleHeightRatio = parseInt(singleHeightSlider.value)/100;
+        if (singleHeightDisplay) singleHeightDisplay.textContent = `${Math.round(state.singleHeightRatio*100)}%`;
+        validateAndUpdateVisuals();
+      });
+    }
     
    // --- Stan edytora ---
-   let clips = JSON.parse(document.getElementById('clips-data').textContent);
+   let clips = [];
+   try {
+     const el = document.getElementById('clips-data');
+     const raw = el ? el.textContent : '';
+     clips = JSON.parse(raw || '[]');
+   } catch (e) {
+     console.error('Failed to parse clips-data:', e);
+     setInfo('Błąd danych klipów: ' + (e.message || e), true);
+     clips = [];
+   }
    let active = null; // {clip_id, url, broadcaster, title}
    let cropping = false;
    let dragStart = null; // {x,y}
@@ -185,20 +236,64 @@
      }
  
      function renderList(){
-       listEl.innerHTML = '';
-       clips.forEach((c)=>{
-         const li = document.createElement('li');
-         li.className = 'clip-item' + (active && active.url===c.url ? ' active' : '');
-         li.textContent = `${c.broadcaster} - ${c.title}`;
-         li.title = c.url;
-         li.addEventListener('click', ()=>selectClip(c));
-         listEl.appendChild(li);
-       });
-     }
+      listEl.innerHTML = '';
+      let newCount = 0;
+      (clips || []).forEach((c)=>{
+        const id = clipIdFromUrl(c.url);
+        const isViewed = viewedSet.has(id);
+        const isNew = !isViewed;
+        if (isNew) newCount++;
+        const shouldHide = state.hideViewed && isViewed && (!active || active.clip_id !== id);
+        if (shouldHide) return;
+        const li = document.createElement('li');
+        li.className = 'clip-item' + (active && active.url===c.url ? ' active' : '');
+        li.title = c.url;
+        li.addEventListener('click', ()=>selectClip(c));
+        const base = document.createElement('span');
+        base.textContent = `${c.broadcaster} - ${c.title}`;
+        li.appendChild(base);
+        if (isNew){
+          const badge = document.createElement('span');
+          badge.textContent = ' NOWE';
+          badge.style.color = '#0a0';
+          badge.style.fontWeight = '600';
+          badge.style.marginLeft = '6px';
+          li.appendChild(badge);
+        }
+        listEl.appendChild(li);
+      });
+
+    }
+
+    // Dodawanie klipu po URL
+    (function(){
+      const input = document.getElementById('add-url-input');
+      const btn = document.getElementById('btn-add-url');
+      if (!input || !btn) return;
+      async function add(){
+        const url = (input.value || '').trim();
+        if (!url) { setInfo('Podaj URL klipu.', true); return; }
+        setInfo('Dodaję klip po URL...');
+        try{
+          const r = await fetch('/api/add-clip-by-url', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ url }) });
+          const j = await r.json();
+          if (!r.ok || !j.ok){ setInfo('Nie udało się dodać klipu: ' + (j.error || r.statusText), true); return; }
+          const clip = j.clip;
+          clips = (clips || []).filter(c=>c.url !== clip.url);
+          clips.push(clip);
+          renderList();
+          selectClip(clip);
+          setInfo('Dodano klip.');
+        }catch(e){ setInfo('Błąd dodawania klipu: ' + e.message, true); }
+      }
+      btn.addEventListener('click', add);
+      input.addEventListener('keydown', (ev)=>{ if (ev.key === 'Enter') add(); });
+    })();
  
-     async function selectClip(c){
+    async function selectClip(c){
        active = { ...c, clip_id: clipIdFromUrl(c.url) };
        window.active = active;
+       markViewed(active.clip_id);
        renderList();
        fetch(`/api/crop/${active.clip_id}`).then(r=>r.json()).then(j=>{
          state.gameRect = j.game || null;
@@ -609,7 +704,14 @@ if (onlyVertical) {
       </div>
       <div style="margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
         <button id="btn-render" class="btn" type="button">🎬 Renderuj 1080x1920</button>
+        <label style="display:flex; align-items:center; gap:6px;">
+          <input type="checkbox" id="include-subtitles" checked>
+          <span>Wypal napisy (karaoke/SRT)</span>
+        </label>
         <a id="render-link" href="#" target="_blank" style="display:none;">Pobierz wynik</a>
+        <button id="btn-render-retry" class="btn" type="button" style="display:none;">🔁 Ponów renderowanie</button>
+        <button id="btn-render-error" class="btn" type="button" style="display:none;">ℹ️ Pokaż błąd</button>
+        <pre id="render-error-details" style="display:none; max-width:480px; white-space:pre-wrap; background:#fff3f3; border:1px solid #f3caca; padding:8px; border-radius:6px;"></pre>
         <button id="btn-publish" class="btn" type="button" style="display:none;">📣 Opublikuj…</button>
         <div id="publish-panel" style="display:none; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px; background:#f6f6f6; padding:8px; border-radius:6px;">
           <label style="display:flex; align-items:center; gap:6px;">
@@ -626,6 +728,11 @@ if (onlyVertical) {
           </div>
           <input type="datetime-local" id="pub-time" style="display:none;" />
           <input type="text" id="pub-caption" placeholder="Podpis posta (opcjonalny)" style="min-width:260px;" />
+          <div style="display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap; margin-top:6px;">
+            <input type="text" id="pub-tag-groups" placeholder="Grupy tagów (np. twitch, merghani)" style="min-width:260px;" />
+            <div id="pub-tag-groups-suggest" class="suggest-box" style="display:none;"></div>
+            <div id="pub-tag-groups-selected" class="tag-list" style="min-width:260px;"></div>
+          </div>
           <button id="btn-publish-confirm" class="btn" type="button">Wyślij</button>
           <span id="publish-status" style="color:#555"></span>
         </div>
@@ -643,9 +750,15 @@ if (onlyVertical) {
   const btnSetEnd = document.getElementById('btn-set-end');
   const btnRender = document.getElementById('btn-render');
   const renderLink = document.getElementById('render-link');
+  const btnRenderRetry = document.getElementById('btn-render-retry');
+  const btnRenderError = document.getElementById('btn-render-error');
+  const renderErrorDetails = document.getElementById('render-error-details');
   const karaokeStatus = document.getElementById('karaoke-status');
+  const includeSubtitlesEl = document.getElementById('include-subtitles');
   const timeSlider = document.getElementById('time-slider');
   const timeLabel = document.getElementById('time-label');
+  let lastRenderPayload = null;
+  let lastRenderResponse = null;
 
   btnSetStart.addEventListener('click', ()=>{ if (video.duration){ trimStartEl.value = video.currentTime.toFixed(2); } });
   btnSetEnd.addEventListener('click', ()=>{ if (video.duration){ trimEndEl.value = video.currentTime.toFixed(2); } });
@@ -665,44 +778,93 @@ if (onlyVertical) {
     const w = previewCanvas.width, h = previewCanvas.height;
     ctxPrev.fillStyle = '#000';
     ctxPrev.fillRect(0,0,w,h);
-    if (!video.videoWidth || !state.gameRect || !state.cameraRect) return;
+    if (!video.videoWidth || !state.gameRect) return;
     const vw = video.videoWidth, vh = video.videoHeight;
+    if (state.singleFrame){
+      // Tło: ten sam klip mocno powiększony i rozmyty, cover całego canvasu
+      (function(){
+        const r = state.gameRect; let sx = Math.floor(r.x*vw), sy = Math.floor(r.y*vh);
+        let sw = Math.floor(r.w*vw), sh = Math.floor(r.h*vh);
+        sw = Math.max(1, Math.min(vw - sx, sw));
+        sh = Math.max(1, Math.min(vh - sy, sh));
+        if (sw<=0||sh<=0) return;
+        const A = w/h, a = sw/sh; let tw, th;
+        if (a > A){ th = h; tw = Math.ceil(h*a); } else { tw = w; th = Math.ceil(w/a); }
+        const ox = Math.floor((w - tw)/2), oy = Math.floor((h - th)/2);
+        ctxPrev.save();
+        ctxPrev.filter = 'blur(12px) brightness(0.85)';
+        ctxPrev.drawImage(video, sx, sy, sw, sh, ox, oy, tw, th);
+        ctxPrev.restore();
+      })();
+      // Panel 21:9 o zadanej wysokości
+      let panelH = Math.round(h * state.singleHeightRatio);
+      if (panelH % 2) panelH += 1; panelH = Math.max(2, Math.min(h, panelH));
+      const panelY = Math.floor((h - panelH)/2);
+      const dw = w, dh = panelH;
+      (function(){
+        const r = state.gameRect; let sx = Math.floor(r.x*vw), sy = Math.floor(r.y*vh);
+        let sw = Math.floor(r.w*vw), sh = Math.floor(r.h*vh);
+        sw = Math.max(1, Math.min(vw - sx, sw));
+        sh = Math.max(1, Math.min(vh - sy, sh));
+        if (sw<=0||sh<=0) return;
+        const a = sw/sh, A = dw/dh; let tw, th;
+        if (a > A){ th = dh; tw = Math.ceil(dh*a); } else { tw = dw; th = Math.ceil(dw/a); }
+        const ox = Math.floor((dw - tw)/2); const oy = Math.floor(panelY + (dh - th)/2);
+        ctxPrev.save(); ctxPrev.beginPath(); ctxPrev.rect(0, panelY, dw, dh); ctxPrev.clip();
+        ctxPrev.drawImage(video, sx, sy, sw, sh, ox, oy, tw, th);
+        ctxPrev.restore();
+      })();
+      return;
+    }
    let topH, botH;
    if (state.autoSplit){
      const aCam = Math.max(1e-6, state.cameraRect.w / Math.max(1e-6, state.cameraRect.h));
      const aGame = Math.max(1e-6, state.gameRect.w / Math.max(1e-6, state.gameRect.h));
      const pCam = 1 / aCam, pGame = 1 / aGame;
      const sum = pCam + pGame;
-     topH = Math.max(1, Math.round(h * (pCam / sum)));
-     botH = h - topH;
+     topH = Math.max(2, Math.round(h * (pCam / sum)));
+     botH = Math.max(2, h - topH);
    } else {
      const g = state.gameRatio, c = 1 - g;
-     topH = Math.round(h * c);
-     botH = h - topH;
+     topH = Math.max(2, Math.round(h * c));
+     botH = Math.max(2, h - topH);
    }
+   // enforce even heights (synchronizacja z ffmpeg)
+   if (topH % 2) topH += 1;
+   if (botH % 2) botH -= 1;
+   if (botH <= 0) botH = 2;
+   if (topH + botH !== h) botH = h - topH;
 
     // camera (top) i game (bottom) bez pasów – wypełnienie (cover)
     function drawCover(r, dx, dy, dw, dh, relief = 1.0){
-      const sx = Math.round(r.x * vw), sy = Math.round(r.y * vh);
-      const sw = Math.round(r.w * vw), sh = Math.round(r.h * vh);
+      let sx = Math.floor(r.x * vw), sy = Math.floor(r.y * vh);
+      let sw = Math.floor(r.w * vw), sh = Math.floor(r.h * vh);
+      sw = Math.max(1, Math.min(vw - sx, sw));
+      sh = Math.max(1, Math.min(vh - sy, sh));
       if (sw <= 0 || sh <= 0) return;
-      const a = sw / sh, A = dw / dh; // a: aspect źródła, A: aspect celu
-      let tw, th; // rozmiar docelowy (może wyjechać poza ramkę, canvas przytnie)
+      const a = sw / sh, A = dw / dh; // a: aspekt źródła, A: aspekt celu
+      let tw, th; // rozmiar docelowy (może wyjechać poza ramkę; obetniemy klipem)
       if (a > A) {
-        // źródło szersze niż cel → dopasuj wysokość, szerokość wyjdzie poza i zostanie przycięta
-        th = Math.round(dh * relief);
-        tw = Math.round((dh * a) * relief);
+        // źródło szersze niż cel → dopasuj wysokość; szerokość może wyjść poza docelową
+        th = Math.ceil(dh * relief);
+        tw = Math.ceil((dh * a) * relief);
       } else {
-        // źródło węższe → dopasuj szerokość, wysokość wyjdzie poza i zostanie przycięta
-        tw = Math.round(dw * relief);
-        th = Math.round((dw / a) * relief);
+        // źródło węższe → dopasuj szerokość; wysokość może wyjść poza docelową
+        tw = Math.ceil(dw * relief);
+        th = Math.ceil((dw / a) * relief);
       }
-      const ox = dx + Math.round((dw - tw)/2);
-      const oy = dy + Math.round((dh - th)/2);
+      const ox = Math.floor(dx + (dw - tw)/2);
+      const oy = Math.floor(dy + (dh - th)/2);
+      // ogranicz rysowanie do obszaru [dx,dy,dw,dh], aby nic nie zachodziło na sąsiednią sekcję
+      ctxPrev.save();
+      ctxPrev.beginPath();
+      ctxPrev.rect(dx, dy, dw, dh);
+      ctxPrev.clip();
       ctxPrev.drawImage(video, sx, sy, sw, sh, ox, oy, tw, th);
+      ctxPrev.restore();
     }
 
-    // camera (top) i game (bottom) – cover; ujednolicone bez reliefu, aby odzwierciedlać eksport 1:1
+    // camera (top) i game (bottom) – cover strict (bez padów/soften)
     drawCover(state.cameraRect, 0, 0, w, topH, 1.0);
     drawCover(state.gameRect, 0, topH, w, botH, 1.0);
   }
@@ -712,34 +874,131 @@ if (onlyVertical) {
   }
   previewLoop();
 
-  btnRender.addEventListener('click', async ()=>{
-    if (!active){ alert('Najpierw wybierz klip.'); return; }
-    if (!state.gameRect || !state.cameraRect){ alert('Najpierw zaznacz oba kadry.'); return; }
+  function makeRenderPayload(){
     const start = parseFloat(trimStartEl.value);
     const end = parseFloat(trimEndEl.value);
-    const payload = {
+    return {
       clip_id: active.clip_id,
       game: state.gameRect,
-      camera: state.cameraRect,
+      camera: state.cameraRect || null,
       game_ratio: state.gameRatio,
       auto_split: !!state.autoSplit,
+      single_frame: !!state.singleFrame,
+      single_height_ratio: state.singleHeightRatio,
+      fit_mode: 'cover',
       start: isFinite(start) ? start : null,
-      end: isFinite(end) ? end : null
+      end: isFinite(end) ? end : null,
+      include_subtitles: includeSubtitlesEl ? !!includeSubtitlesEl.checked : true
     };
+  }
+  function pollRenderUntilFinish(clipId){
+    let attempts = 0;
+    const maxAttempts = 180; // ~6 min przy 2s
+    const intervalMs = 2000;
+    const tick = async ()=>{
+      attempts++;
+      try{
+        const r = await fetch(`/api/render/status?clip_id=${encodeURIComponent(clipId)}`, { cache:'no-store' });
+        const s = await r.json().catch(()=>({}));
+        if (s && s.state === 'done' && s.url){
+          renderLink.href = s.url; renderLink.style.display = 'inline-block';
+          const btnPublish = document.getElementById('btn-publish'); if (btnPublish) btnPublish.style.display = 'inline-block';
+          if (karaokeStatus){ karaokeStatus.style.display = 'inline-block'; karaokeStatus.textContent = `Karaoke: ${s.karaoke || 'brak'}`; }
+          setInfo('Render zakończony.');
+          if (btnRenderRetry) btnRenderRetry.style.display = 'none';
+          if (btnRenderError) btnRenderError.style.display = 'none';
+          if (renderErrorDetails) renderErrorDetails.style.display = 'none';
+          return; // stop polling
+        }
+        if (s && s.state === 'error'){
+          setInfo('Błąd renderu: ' + (s.error || ''));
+          if (btnRenderRetry) btnRenderRetry.style.display = 'inline-block';
+          if (btnRenderError) btnRenderError.style.display = 'inline-block';
+          if (renderErrorDetails){ renderErrorDetails.textContent = JSON.stringify(s, null, 2); }
+          return; // stop polling
+        }
+        // running/idle → continue
+      }catch(e){ /* ignore and continue */ }
+      if (attempts < maxAttempts){
+        setTimeout(tick, intervalMs);
+      } else {
+        setInfo('Timeout oczekiwania na zakończenie renderu.', true);
+        if (btnRenderRetry) btnRenderRetry.style.display = 'inline-block';
+      }
+    };
+    tick();
+  }
+  async function performRender(payload){
     setInfo('Render w toku...');
     renderLink.style.display = 'none';
     if (karaokeStatus){ karaokeStatus.style.display = 'inline-block'; karaokeStatus.textContent = 'Karaoke: (w toku...)'; }
+    // reset error UI
+    if (btnRenderRetry) btnRenderRetry.style.display = 'none';
+    if (btnRenderError) btnRenderError.style.display = 'none';
+    if (renderErrorDetails){ renderErrorDetails.style.display = 'none'; renderErrorDetails.textContent = ''; }
+    lastRenderPayload = payload;
     try{
       const r = await fetch('/api/render', { method:'POST', headers:{'Content-Type':'application/json'}, cache:'no-store', body: JSON.stringify(payload)});
-      const j = await r.json();
-      if (!j.ok){ setInfo('Błąd renderu: ' + (j.error || '')); if (karaokeStatus){ karaokeStatus.textContent = 'Karaoke: błąd'; } return; }
+      let j;
+      try {
+        j = await r.json();
+      } catch (parseErr) {
+        const txt = await r.text().catch(()=> '');
+        j = { ok:false, error: 'Invalid JSON response', status: r.status, content_type: (r.headers && r.headers.get ? r.headers.get('content-type') : undefined), text_snippet: (txt||'').slice(0, 400) };
+      }
+      lastRenderResponse = j;
+      if (!j.ok){
+        setInfo('Błąd renderu: ' + (j.error || ''));
+        if (karaokeStatus){ karaokeStatus.textContent = 'Karaoke: błąd'; }
+        if (btnRenderRetry) btnRenderRetry.style.display = 'inline-block';
+        if (btnRenderError) btnRenderError.style.display = 'inline-block';
+        if (renderErrorDetails){ renderErrorDetails.textContent = JSON.stringify(j, null, 2); }
+        // fallback: jeśli tunel/edge zwraca 524/504 (HTML), rozpocznij polling statusu renderu
+        const isEdgeTimeout = (String(j.status)==='524' || String(j.status)==='504' || (j.content_type||'').includes('text/html'));
+        if (isEdgeTimeout && active && active.clip_id){
+          setInfo('Render prawdopodobnie trwa w tle — sprawdzam status…');
+          if (karaokeStatus){ karaokeStatus.style.display = 'inline-block'; karaokeStatus.textContent = 'Karaoke: (w toku...)'; }
+          pollRenderUntilFinish(active.clip_id);
+        }
+        return;
+      }
       renderLink.href = j.url; renderLink.style.display = 'inline-block';
       const btnPublish = document.getElementById('btn-publish'); if (btnPublish) btnPublish.style.display = 'inline-block';
       const kinfo = (j.karaoke ? ` (karaoke: ${j.karaoke})` : '');
       if (karaokeStatus){ karaokeStatus.style.display = 'inline-block'; karaokeStatus.textContent = `Karaoke: ${j.karaoke || 'brak'}`; }
       setInfo('Render zakończony.' + kinfo);
-    }catch(e){ setInfo('Błąd renderu: ' + e.message, true); if (karaokeStatus){ karaokeStatus.textContent = 'Karaoke: błąd'; } }
+      // success → hide error helpers
+      if (btnRenderRetry) btnRenderRetry.style.display = 'none';
+      if (btnRenderError) btnRenderError.style.display = 'none';
+      if (renderErrorDetails) renderErrorDetails.style.display = 'none';
+    }catch(e){
+      setInfo('Błąd renderu: ' + e.message, true);
+      if (karaokeStatus){ karaokeStatus.textContent = 'Karaoke: błąd'; }
+      if (btnRenderRetry) btnRenderRetry.style.display = 'inline-block';
+      if (btnRenderError) btnRenderError.style.display = 'inline-block';
+      if (renderErrorDetails){ renderErrorDetails.textContent = String(e && e.stack ? e.stack : e.message || e); }
+    }
+  }
+  btnRender.addEventListener('click', async ()=>{
+    if (!active){ alert('Najpierw wybierz klip.'); return; }
+    if (!state.gameRect || (!state.singleFrame && !state.cameraRect)){ alert('Najpierw zaznacz wymagane kadry.'); return; }
+    await performRender(makeRenderPayload());
   });
+  if (btnRenderRetry){
+    btnRenderRetry.addEventListener('click', async ()=>{
+      if (!lastRenderPayload){ alert('Brak poprzednich parametrów renderu.'); return; }
+      const go = confirm('Ponowić renderowanie tego klipu z tymi samymi parametrami?');
+      if (!go) return;
+      btnRenderRetry.disabled = true;
+      try{ await performRender(lastRenderPayload); } finally { btnRenderRetry.disabled = false; }
+    });
+  }
+  if (btnRenderError && renderErrorDetails){
+    btnRenderError.addEventListener('click', ()=>{
+      const vis = renderErrorDetails.style.display !== 'none';
+      renderErrorDetails.style.display = vis ? 'none' : 'block';
+    });
+  }
   </script>
 
   <script>
@@ -801,11 +1060,72 @@ if (onlyVertical) {
     const pubSched = document.getElementById('pub-sched');
     const pubTime = document.getElementById('pub-time');
     const pubCaption = document.getElementById('pub-caption');
+    const pubTagGroupsInput = document.getElementById('pub-tag-groups');
+    const pubTagGroupsSuggest = document.getElementById('pub-tag-groups-suggest');
+    const pubTagGroupsSelected = document.getElementById('pub-tag-groups-selected');
     const btnPublishConfirm = document.getElementById('btn-publish-confirm');
     const publishStatus = document.getElementById('publish-status');
     const renderLink = document.getElementById('render-link');
     const pubAccounts = document.getElementById('pub-accounts');
     const pubAccountsLoading = document.getElementById('pub-accounts-loading');
+    // --- Grupy tagów ---
+    window.tagGroups = {};
+    window.selectedGroups = new Set();
+    function renderSelectedGroups(){
+      if (!pubTagGroupsSelected) return;
+      pubTagGroupsSelected.innerHTML = '';
+      if (selectedGroups.size === 0){
+        pubTagGroupsSelected.innerHTML = '<span style="color:#888;">Brak wybranych grup</span>';
+        return;
+      }
+      Array.from(selectedGroups).forEach(name=>{
+        const el = document.createElement('span');
+        el.className = 'tag';
+        el.innerHTML = `<span>${name}</span> <button class="remove" title="Usuń">✖</button>`;
+        const rm = el.querySelector('.remove');
+        if (rm) rm.addEventListener('click', ()=>{ selectedGroups.delete(name); renderSelectedGroups(); });
+        pubTagGroupsSelected.appendChild(el);
+      });
+    }
+    function hideSuggest(){ if (pubTagGroupsSuggest){ pubTagGroupsSuggest.style.display='none'; pubTagGroupsSuggest.innerHTML=''; } }
+    function showSuggest(items){
+      if (!items.length){ hideSuggest(); return; }
+      if (!pubTagGroupsInput || !pubTagGroupsSuggest) return;
+      pubTagGroupsSuggest.style.display = 'block';
+      const rect = pubTagGroupsInput.getBoundingClientRect();
+      pubTagGroupsSuggest.style.position = 'absolute';
+      pubTagGroupsSuggest.style.top = (window.scrollY + rect.bottom + 4) + 'px';
+      pubTagGroupsSuggest.style.left = (window.scrollX + rect.left) + 'px';
+      pubTagGroupsSuggest.style.minWidth = rect.width + 'px';
+      pubTagGroupsSuggest.innerHTML = items.map(({name,tags})=>`<div class="suggest-item" data-name="${name}"><span>${name}</span><span class="platform">${(tags||[]).length} tagów</span></div>`).join('');
+      pubTagGroupsSuggest.querySelectorAll('.suggest-item').forEach(el=>{
+        el.addEventListener('click', ()=>{
+          const g = el.dataset.name;
+          selectedGroups.add(g);
+          if (pubTagGroupsInput) pubTagGroupsInput.value = g;
+          hideSuggest();
+          renderSelectedGroups();
+          if (pubTagGroupsInput) pubTagGroupsInput.focus();
+        });
+      });
+    }
+    async function loadTagGroups(){
+      try{
+        const r = await fetch('/api/streamers-prefs', { cache:'no-store' });
+        const j = await r.json();
+        tagGroups = (j && typeof j.tag_groups==='object') ? j.tag_groups : {};
+      }catch{/* ignore */}
+    }
+    if (pubTagGroupsInput){
+      pubTagGroupsInput.addEventListener('input', ()=>{
+        const q = (pubTagGroupsInput.value||'').trim().toLowerCase();
+        if (!q){ hideSuggest(); return; }
+        const entries = Object.entries(tagGroups||{}).map(([name,tags])=>({name, tags}));
+        const matched = entries.filter(e=> e.name.includes(q)).slice(0, 10);
+        showSuggest(matched);
+      });
+      pubTagGroupsInput.addEventListener('blur', ()=> setTimeout(hideSuggest, 120));
+    }
 
     async function loadPublerAccounts(){
       if (!pubAccounts || pubAccounts.dataset.loaded === '1') return;
@@ -863,7 +1183,7 @@ if (onlyVertical) {
       const willShow = (publishPanel.style.display === 'none' || publishPanel.style.display === '');
       publishPanel.style.display = willShow ? 'flex' : 'none';
       publishStatus.textContent = '';
-      if (willShow){ await loadPublerAccounts(); }
+      if (willShow){ await loadPublerAccounts(); await loadTagGroups(); renderSelectedGroups(); }
     });
     pubNow?.addEventListener('change', ()=>{ if (pubNow.checked){ pubTime.style.display = 'none'; }});
     pubSched?.addEventListener('change', ()=>{ if (pubSched.checked){ pubTime.style.display = 'inline-block'; }});
@@ -875,7 +1195,26 @@ if (onlyVertical) {
         }
         publishStatus.textContent = 'Wysyłam…';
         const clip_id = window.active.clip_id;
-        const body = { caption: pubCaption.value || undefined };
+        // Wklej tagi z wybranych grup do podpisu (deduplikacja)
+        let caption = pubCaption.value || '';
+        const existing = new Set((caption.match(/(^|\s)#\w+/g)||[]).map(s=>s.trim().toLowerCase()));
+        const addTags = [];
+        Array.from(selectedGroups).forEach(name=>{
+          const tags = tagGroups[name] || [];
+          tags.forEach(t=>{
+            const norm = (t||'').trim();
+            if (!norm) return;
+            const withHash = norm.startsWith('#') ? norm : ('#' + norm);
+            const key = withHash.toLowerCase();
+            if (!existing.has(key)) { existing.add(key); addTags.push(withHash); }
+          });
+        });
+        if (addTags.length > 0){
+          const sep = caption ? ' ' : '';
+          caption = caption + sep + addTags.join(' ');
+          pubCaption.value = caption; // uaktualnij widocznie
+        }
+        const body = { caption: caption || undefined };
         if (pubSched.checked){
           const dt = pubTime.value; // yyyy-MM-ddTHH:mm
           if (!dt){ publishStatus.textContent = 'Wybierz datę i czas.'; return; }
@@ -899,6 +1238,45 @@ if (onlyVertical) {
         else { publishStatus.textContent = 'Wysłano. Sprawdź logi.'; }
       }catch(e){ publishStatus.textContent = 'Błąd: ' + e.message; }
     });
+    // Usuwanie zbędnych węzłów tekstowych na końcu dokumentu (np. same nawiasy)
+    try {
+      Array.from(document.body.childNodes).forEach(n=>{
+        if (n.nodeType === Node.TEXT_NODE){
+          const s = n.textContent || '';
+          if (/^[\s}]+$/.test(s)) n.remove();
+        }
+      });
+      // Uruchom ponownie po pełnym parsowaniu dokumentu, by złapać później wstawione węzły
+      document.addEventListener('DOMContentLoaded', ()=>{
+        Array.from(document.body.childNodes).forEach(n=>{
+          if (n.nodeType === Node.TEXT_NODE){
+            const s = n.textContent || '';
+            if (/^[\s}]+$/.test(s)) n.remove();
+          }
+        });
+      }, { once:true });
+      // Dodatkowo obserwuj późniejsze wstawienia i natychmiast usuwaj artefakty
+      const obs = new MutationObserver(muts=>{
+        try{
+          muts.forEach(m=>{
+            (m.addedNodes || []).forEach(n=>{
+              if (n.nodeType === Node.TEXT_NODE){
+                const s = n.textContent || '';
+                if (/^[\s}]+$/.test(s)) n.remove();
+              } else if (n.nodeType === Node.ELEMENT_NODE){
+                Array.from(n.childNodes).forEach(c=>{
+                  if (c.nodeType === Node.TEXT_NODE){
+                    const s = c.textContent || '';
+                    if (/^[\s}]+$/.test(s)) c.remove();
+                  }
+                });
+              }
+            });
+          });
+        }catch(e){}
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+    } catch (e) {}
   })();
   </script>
 
@@ -2422,3 +2800,5 @@ if (onlyVertical) {
   }
   }
   }
+  </body>
+  </html>

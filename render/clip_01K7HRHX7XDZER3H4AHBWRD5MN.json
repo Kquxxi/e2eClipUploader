@@ -1,0 +1,25 @@
+{
+  "clip_id": "clip_01K7HRHX7XDZER3H4AHBWRD5MN",
+  "state": "done",
+  "url": "/media/exports/clip_01K7HRHX7XDZER3H4AHBWRD5MN_1080x1920.mp4",
+  "karaoke": "applied",
+  "karaoke_debug": null,
+  "ffmpeg_cmd": "C:\\ffmpeg\\bin\\ffmpeg.EXE -y -i c:\\Users\\Kquxxi\\Klipy\\media\\clips\\clip_01K7HRHX7XDZER3H4AHBWRD5MN.mp4 -filter_complex [0:v]crop=floor(iw*0.997696):floor(ih*1):floor(iw*0.002304):floor(ih*0),scale=w='if(gt(a,1080/1920),-2,1080)':h='if(gt(a,1080/1920),1920,-2)',crop=1080:1920:floor((iw-1080)/2):floor((ih-1920)/2),gblur=sigma=16,eq=brightness=-0.08[bg];[0:v]crop=floor(iw*0.997696):floor(ih*1):floor(iw*0.002304):floor(ih*0),scale=w='if(gt(a,1080/1824),-2,1080)':h='if(gt(a,1080/1824),1824,-2)',crop=1080:1824:floor((iw-1080)/2):floor((ih-1824)/2)[panel];[bg][panel]overlay=x=0:y=(H-h)/2[outv] -map [outv] -map 0:a:0? -r 30 -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p -c:a aac -b:a 192k -shortest -movflags +faststart c:\\Users\\Kquxxi\\Klipy\\media\\exports\\clip_01K7HRHX7XDZER3H4AHBWRD5MN_1080x1920.mp4",
+  "params": {
+    "game": {
+      "x": 0.002304147465437788,
+      "y": 0,
+      "w": 0.9976958525345622,
+      "h": 1
+    },
+    "camera": {},
+    "game_ratio": 0.7,
+    "auto_split": false,
+    "single_frame": true,
+    "single_height_ratio": 0.95,
+    "fit_mode": "cover",
+    "start": null,
+    "end": null,
+    "include_subtitles": true
+  }
+}

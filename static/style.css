@@ -5,6 +5,7 @@
   --text: #333;
   --border: #ddd;
   --radius: 6px;
+  --tableHeight: 520px; /* wspólna wysokość kontenera tabeli Twitch/Kick */
 }
 
 body {
@@ -30,6 +31,21 @@ header {
   margin: 0.5rem 0;
 }
 
+/* Sub-actions panel moved below header */
+.subactions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  background: #f6f7fb;
+  border: 1px solid #dde1f3;
+  border-radius: var(--radius);
+}
+.subactions .hint {
+  color: #4a4f61;
+  font-size: 0.95rem;
+}
+
 .btn {
   background: var(--primary);
   color: #fff;
@@ -42,9 +58,157 @@ header {
 }
 .btn:hover { background: var(--primary-dark); }
 
+/* Zapewnij spójny rozmiar dla linków z klasą .btn jak dla <button> */
+a.btn {
+  display: inline-block;
+  text-decoration: none;
+  line-height: 1.2;
+  vertical-align: middle;
+}
+
+/* Przycisk Panel admina w prawym górnym rogu strony */
+#admin-link {
+  position: fixed;
+  top: 10px;
+  right: 10px;
+  margin: 0;
+  z-index: 1000;
+}
+
+/* Wariant małego przycisku do użycia w wierszach tabeli */
+.btn-small {
+  height: 20px; /* stała, mniejsza wysokość */
+  padding: 0 6px; /* stały poziomy padding, brak pionowego */
+  font-size: 12px;
+  line-height: 1; /* brak zmiany wysokości przez line-height */
+  margin: 0; /* brak dodatkowej przestrzeni w komórce */
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  box-sizing: border-box;
+}
+.btn-small:disabled,
+.btn-small:active {
+  height: 20px; /* nie zmieniaj wysokości po kliknięciu lub wyłączeniu */
+  padding: 0 6px; /* nie zmieniaj paddingu */
+}
+
+/* Bardzo mały przycisk tylko z ikoną (➕ / ✖) */
+.btn-icon {
+  width: 20px !important;
+  height: 20px !important;
+  min-width: 20px !important;
+  min-height: 20px !important;
+  padding: 0 !important;
+  font-size: 14px; /* czytelna ikona przy stałym rozmiarze */
+  line-height: 1; 
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  box-sizing: border-box;
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  cursor: pointer;
+  color: inherit; /* kolor kontrolowany przez .icon-toggle */
+}
+.btn-icon:disabled,
+.btn-icon:active {
+  width: 20px !important;
+  height: 20px !important;
+  padding: 0 !important;
+  background: transparent !important;
+  border: none !important;
+}
+.btn-icon:hover,
+.btn-icon:focus {
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+/* Zapewnij, że przycisk w komórce nie zwiększa wysokości wiersza */
+#report-table td .btn,
+#report-table td .btn-small,
+#report-table td .btn-icon,
+#report-table td .icon-toggle {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+
+/* Ikona-only toggle: zielony ➕, na hover (gdy zapisany) pokazuj ✖ */
+.icon-toggle {
+  font-size: 14px; /* spójnie z btn-icon */
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  color: #6b5bd6; /* domyślny kolor ikony */
+  cursor: pointer;
+  user-select: none;
+  transition: color .15s ease;
+}
+/* Zapisany klip ma zieloną ikonę X */
+.icon-toggle.added { color: #dc2626; }
+/* Hover dla zapisanych – utrzymuj czerwony (✖) */
+.icon-toggle.remove { color: #dc2626; }
+/* Hover dla niezapisanych – plus staje się zielony */
+.icon-toggle:hover:not(.added) { color: #16a34a; }
+/* Wzmocniona specyficzność, aby pokonać dziedziczenie/kolory tabeli */
+.btn-icon.icon-toggle:hover:not(.added),
+.add-to-editor.icon-toggle:hover:not(.added),
+.icon-toggle.hover-add { color: #16a34a !important; }
+/* Globalna reguła hover – dodatkowe zabezpieczenie */
+.add-to-editor:hover:not(.added) { color: #16a34a !important; }
+.add-to-editor.added:hover { color: #dc2626 !important; }
+/* Fallback: zielony plus przy najechaniu na cały wiersz tabeli */
+#report-table tbody tr:hover .icon-toggle:not(.added) { color: #16a34a !important; }
+
 .status {
   font-style: italic;
   margin-top: 0.5rem;
+}
+
+/* Pasek postępu */
+.progress-bar {
+  position: relative;
+  height: 8px;
+  background: #eee;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: var(--primary);
+  width: 0%;
+  transition: width 0.3s ease;
+}
+
+/* Oznaczenia nowych i obejrzanych wierszy */
+.new-row {
+  animation: pulse-bg 1.2s ease-out 1;
+}
+.new-unviewed {
+  background: #fffef5;
+  /* Mały żółty pasek po lewej stronie dla nowych klipów */
+  box-shadow: inset 6px 0 0 #ffeb3b;
+}
+.viewed-row {
+  opacity: 0.65;
+}
+
+@keyframes pulse-bg {
+  0% { background-color: #fffbec; }
+  100% { background-color: transparent; }
 }
 
 /* Filtry jako dropdown z checkboxami */
@@ -136,4 +300,99 @@ header {
 }
 #report-table td a:hover {
   text-decoration: underline;
+}
+
+/* Kick: zwiększ miejsce na tytuł i wyrównaj szerokości kolumn */
+#kick-report-root #report-table {
+  table-layout: fixed;
+}
+#kick-report-root #report-table th:nth-child(1),
+#kick-report-root #report-table td:nth-child(1) { width: 8%; }
+#kick-report-root #report-table th:nth-child(2),
+#kick-report-root #report-table td:nth-child(2) { width: 22%; }
+#kick-report-root #report-table th:nth-child(3),
+#kick-report-root #report-table td:nth-child(3) { width: 40%; }
+#kick-report-root #report-table th:nth-child(4),
+#kick-report-root #report-table td:nth-child(4) { width: 14%; text-align: right; }
+#kick-report-root #report-table th:nth-child(5),
+#kick-report-root #report-table td:nth-child(5) { width: 16%; }
+
+/* Wspólny kontener o tej samej wysokości dla Twitch i Kick */
+.unified-table {
+  position: relative;
+  height: var(--tableHeight);
+  max-height: var(--tableHeight);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fff;
+}
+
+/* Twitch/Kick: ustalona wysokość wierszy tabeli (~22.4px total)
+   Padding: góra/dół 0.35rem (~5.6px), lewo/prawo 0.6rem (~9.6px)
+   Line-height tak dobrany, by suma dała ~22.4px. */
+#twitch-report-root #report-table thead th,
+#twitch-report-root #report-table tbody td,
+#kick-report-root   #report-table thead th,
+#kick-report-root   #report-table tbody td {
+  padding: 0.35rem 0.6rem; /* 5.6px / 9.6px zgodnie z podglądem */
+  line-height: 0.7rem;     /* ~11.2px → 11.2 + 5.6 + 5.6 ≈ 22.4 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#twitch-report-root #report-table tbody tr,
+#kick-report-root   #report-table tbody tr {
+  height: 22.4px; /* docelowa stała wysokość wiersza */
+}
+/* Stały pasek edytora na dole strony */
+.fixed-editor-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 9998;
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  align-items: center;
+  padding: 10px;
+  background: rgba(246, 247, 251, 0.95);
+  border-top: 1px solid #dde1f3;
+}
+/* FAB: Dalej do edytora w prawym dolnym rogu */
+.fab-proceed {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 9999;
+  border-radius: 999px;
+  box-shadow: 0 6px 14px rgba(0,0,0,0.2);
+  padding: 10px 16px;
+}
+
+/* Kolor X (usuń) ma być czerwony, nie zielony */
+.add-to-editor.remove {
+  color: #dc2626 !important; /* czerwony */
+}
+.add-to-editor.added {
+  color: inherit; /* nie wymuszaj zielonego dla stanu dodanego */
+}
+.add-to-editor.added:hover {
+  color: #dc2626 !important; /* czerwony na hover dla stanu dodanego */
+}
+
+/* Odznaka i akcent dla wyróżnionych streamerów */
+.badge-featured {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: #FFD54F; /* ciepły żółty */
+  color: #111;
+  font-size: 12px;
+  font-weight: 600;
+}
+.featured-streamer {
+  border-left: 4px solid #FFD54F;
 }

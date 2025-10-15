@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <title>Panel Twitch Clips</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ cache_buster }}">
 </head>
 <body>
   <div class="container">
@@ -13,22 +13,447 @@
         <button id="btn-update" class="btn">Odśwież streamerów twitch</button>
         <button id="btn-report" class="btn">Generuj raport Twitch</button>
         <button id="btn-kick" class="btn">Generuj raport Kick</button>
+        <a href="/admin" id="admin-link" class="btn" title="Preferencje streamerów">⚙️ Panel admina</a>
         <span id="spinner" style="display:none;margin-left:8px;">⏳</span>
-        <div id="kick-report-container"></div>
-
       </div>
       <div id="status" class="status"></div>
+    <div id="progress-counter" class="status" style="display:none"></div>
+    <div id="auto-refresh" class="status" style="margin-top:6px;">
+      🔁 Auto-odświeżanie za: <span id="refresh-timer">--:--</span>
+      <div id="twitch-progress-bar" class="progress-bar" style="margin-top:6px; display:none;">
+        <div id="progress-fill" class="progress-fill" style="width:0%"></div>
+      </div>
+    </div>
+    <!-- Kick: progres analogiczny do Twitch -->
+    <div id="kick-progress" class="status" style="margin-top:6px; display:none;">
+      🟢 Kick: postęp: <span id="progress-counter-kick">—</span>
+      <div id="kick-progress-bar" class="progress-bar" style="margin-top:6px; display:none;">
+        <div id="progress-fill-kick" class="progress-fill" style="width:0%"></div>
+      </div>
+    </div>
     </header>
 
-    <main id="raport-container"></main>
+    <div id="view-controls" class="subactions" style="margin:12px 0;">
+      <button id="btn-hide-viewed" class="btn">Ukryj obejrzane</button>
+      <span id="global-count" class="hint"></span>
+    </div>
+
+    <!-- Globalny pasek edytora: zawsze widoczny niezależnie od raportu -->
+    <div id="global-editor-fixedbar" class="fixed-editor-bar" style="display:flex;">
+      <button id="proceed-editor-fixed" class="btn" disabled>➡️ Dalej do edytora</button>
+      <button id="view-saved-fixed" class="btn">👁️ Pokaż zapisane</button>
+    </div>
+
+    <main>
+<section id="raport-container" style="display:none;"></section>
+<!-- Stały pasek edytora na dole: dwa przyciski główne -->
+<div id="fallback-editor-controls" style="position:fixed; left:0; right:0; bottom:0; display:flex; gap:8px; padding:8px; background:rgba(20,20,24,0.9); border-top:1px solid #333; justify-content:center; z-index:1000;">
+  <button id="fallback-proceed-editor" class="btn" title="Przejdź do edytora z zapisanymi">➕ Dodaj do edytora</button>
+  <button id="fallback-view-saved" class="btn" title="Pokaż/Ukryj zapisane">📌 Pokaż zapisane</button>
+</div>
+<!-- Overlay zapisanych klipów -->
+<div id="saved-clips-panel" style="display:none; position:fixed; right:12px; bottom:56px; width:360px; max-height:50vh; overflow:auto; background:#15161a; border:1px solid #333; border-radius:6px; box-shadow:0 8px 24px rgba(0,0,0,0.4); padding:10px; z-index:999;"></div>
+      <section id="kick-report-container" style="display:none; margin-top:12px;"></section>
+    </main>
   </div>
 
-  <script>
+  <script type="text/javascript">
     const statusEl = document.getElementById('status');
+  const progressCounter = document.getElementById('progress-counter');
     const raportContainer = document.getElementById('raport-container');
     const btnReport = document.getElementById('btn-report');
     const btnKick = document.getElementById('btn-kick');
     const spinner = document.getElementById('spinner');
+    const refreshTimerEl = document.getElementById('refresh-timer');
+    const progressFillEl = document.getElementById('progress-fill');
+    const progressCounterKick = document.getElementById('progress-counter-kick');
+    const progressFillElKick = document.getElementById('progress-fill-kick');
+    const twitchProgressBar = document.getElementById('twitch-progress-bar');
+    // Lokalne przyciski z fragmentu Twitch będą podpinane po wstrzyknięciu
+    const kickProgressContainer = document.getElementById('kick-progress');
+    const kickProgressBar = document.getElementById('kick-progress-bar');
+    let kickProgressInterval = null;
+    let kickStatusPollId = null;
+    let kickReadyPollId = null;
+    let kickFinishedHideTimeoutId = null;
+
+
+    let reportReadyPoll = null;
+    let reportStatusPoll = null;
+    // Lokalny timer 15-minutowy i lekkie pollowanie tylko podczas generowania
+    let nextRunAt = null;            // ms timestamp następnego uruchomienia (lokalny)
+    let countdownTimerId = null;     // setInterval id dla lokalnego odliczania
+    let autoGenPollId = null;        // setInterval id pollowania statusu w trakcie generowania
+    let autoGenReadyPollId = null;   // setInterval id pollowania gotowości raportu (Twitch)
+    let autoGenKickReadyPollId = null; // setInterval id pollowania gotowości raportu Kick (cicho)
+    let ensureKickMountPollId = null;  // stały strażnik: jeśli gotowy i kontener pusty, dociągnij fragment
+    let autoGenActive = false;       // flaga: czy aktualnie trwa generowanie
+    let autoTriggerStarted = false;  // strażnik: czy auto-trigger tego cyklu już wystartował
+    let autoGenSeenActive = false;   // strażnik: czy w bieżącym cyklu status był aktywny
+    let ensureTwitchMountPollId = null; // strażnik: po reloadzie dociągnij fragment Twitch, jeśli gotowy
+    // Guardy przeciw wielokrotnemu wczytaniu i wstrzyknięciu fragmentu Twitch
+    if (typeof window.twitchFragmentLoaded === 'undefined') window.twitchFragmentLoaded = false;
+    if (typeof window.twitchFragmentLoading === 'undefined') window.twitchFragmentLoading = false;
+    // Guard na równoległe zapytania /api/report-ready
+    let readyFetchLock = false;
+    // Guard na równoległe zapytania /api/report-status
+    let statusFetchLock = false;
+    
+
+    // Guardy przeciw wielokrotnemu wczytaniu i wstrzyknięciu fragmentu Twitch (duplikat – usuń)
+    // [cleanup] usunięto podwójną deklarację let twitchFragmentLoaded/twitchFragmentLoading
+
+    // Ostatni znany status i koordynacja pollowania między wieloma podglądami
+    let latestStatus = null;
+    const LEADER_KEY = 'pollLeaderV1';
+    const LATEST_STATUS_KEY = 'latestStatusV1';
+    const LEADER_TTL_MS = 5000;
+    const leaderId = Math.random().toString(36).slice(2);
+    let isPollLeader = true; // leader disabled: każda karta działa samodzielnie
+    let leaderHeartbeatId = null;
+    const nowMs = ()=>Date.now();
+    const readLeader = ()=>{ try { return JSON.parse(localStorage.getItem(LEADER_KEY)||'null'); } catch{ return null; } };
+    const writeLeader = (obj)=>{ try { localStorage.setItem(LEADER_KEY, JSON.stringify(obj)); } catch{} };
+    const readLatest = ()=>{ try { return JSON.parse(localStorage.getItem(LATEST_STATUS_KEY)||'{}'); } catch{ return {}; } };
+    const writeLatest = (p)=>{ try { localStorage.setItem(LATEST_STATUS_KEY, JSON.stringify(p||{})); } catch{} };
+    function acquireLeaderIfPossible(){
+      const cur = readLeader();
+      const expired = !cur || !cur.ts || ((nowMs()-cur.ts) > LEADER_TTL_MS);
+      if (expired || (cur && cur.id === leaderId)){
+        isPollLeader = true;
+        writeLeader({ id: leaderId, ts: nowMs() });
+        if (leaderHeartbeatId) clearInterval(leaderHeartbeatId);
+        leaderHeartbeatId = setInterval(()=>{ writeLeader({ id: leaderId, ts: nowMs() }); }, 2000);
+      } else {
+        isPollLeader = false;
+        if (leaderHeartbeatId) { clearInterval(leaderHeartbeatId); leaderHeartbeatId = null; }
+      }
+    }
+    function releaseLeader(){
+      const cur = readLeader();
+      if (cur && cur.id === leaderId){ try { localStorage.removeItem(LEADER_KEY); } catch{} }
+      isPollLeader = false;
+      if (leaderHeartbeatId) { clearInterval(leaderHeartbeatId); leaderHeartbeatId = null; }
+    }
+    window.addEventListener('storage', (e)=>{ if (e.key === LEADER_KEY) acquireLeaderIfPossible(); });
+    document.addEventListener('visibilitychange', ()=>{ if (document.hidden) releaseLeader(); else acquireLeaderIfPossible(); });
+    window.addEventListener('beforeunload', releaseLeader);
+    setTimeout(acquireLeaderIfPossible, 0);
+
+    // Obserwator: uruchamiaj oznaczanie NOWE po wstrzyknięciu/zmianie treści raportu
+    function debounce(fn, wait){
+      let t;
+      return function(...args){
+        try{ clearTimeout(t); }catch{}
+        t = setTimeout(()=>{ try{ fn.apply(this, args); }catch{} }, wait);
+      };
+    }
+    function setupMarkObservers(){
+      try{
+        const runMark = (root)=>{ if (!root) return; try{ markNewRowsAfterInject(root); updateGlobalCounters(); }catch{} };
+        const twitchRoot = document.getElementById('raport-container');
+        const kickRoot = document.getElementById('kick-report-container');
+        const opts = { childList: true, subtree: true };
+        if (twitchRoot){
+          const obsT = new MutationObserver(debounce(()=>runMark(twitchRoot), 120));
+          obsT.observe(twitchRoot, opts);
+          runMark(twitchRoot);
+          window.twitchMarkObserver = obsT;
+        }
+        if (kickRoot){
+          const obsK = new MutationObserver(debounce(()=>runMark(kickRoot), 120));
+          obsK.observe(kickRoot, opts);
+          runMark(kickRoot);
+          window.kickMarkObserver = obsK;
+        }
+      }catch{}
+    }
+    try{ setupMarkObservers(); }catch{}
+
+    // Centralne czyszczenie wszystkich interwałów związanych z pollowaniem
+    function stopAllIntervals(){
+      try{ if (autoGenPollId) { clearInterval(autoGenPollId); autoGenPollId = null; } }catch{}
+      try{ if (autoGenReadyPollId) { clearInterval(autoGenReadyPollId); autoGenReadyPollId = null; } }catch{}
+      try{ if (reportStatusPoll) { clearInterval(reportStatusPoll); reportStatusPoll = null; } }catch{}
+      try{ if (reportReadyPoll) { clearInterval(reportReadyPoll); reportReadyPoll = null; } }catch{}
+      try{ if (ensureTwitchMountPollId) { clearInterval(ensureTwitchMountPollId); ensureTwitchMountPollId = null; } }catch{}
+      try{ if (ensureKickMountPollId) { clearInterval(ensureKickMountPollId); ensureKickMountPollId = null; } }catch{}
+      try{ if (kickStatusPollId) { clearInterval(kickStatusPollId); kickStatusPollId = null; } }catch{}
+      try{ if (kickReadyPollId) { clearInterval(kickReadyPollId); kickReadyPollId = null; } }catch{}
+      // nie czyścimy countdownTimerId – timer ma działać w trybie idle
+    }
+
+    // Selewtywne czyszczenie interwałów Twitch, bez ruszania pollowania Kick
+    function stopTwitchIntervalsOnly(){
+      try{ if (autoGenPollId) { clearInterval(autoGenPollId); autoGenPollId = null; } }catch{}
+      try{ if (autoGenReadyPollId) { clearInterval(autoGenReadyPollId); autoGenReadyPollId = null; } }catch{}
+      try{ if (reportStatusPoll) { clearInterval(reportStatusPoll); reportStatusPoll = null; } }catch{}
+      try{ if (reportReadyPoll) { clearInterval(reportReadyPoll); reportReadyPoll = null; } }catch{}
+      try{ if (ensureTwitchMountPollId) { clearInterval(ensureTwitchMountPollId); ensureTwitchMountPollId = null; } }catch{}
+      // kickStatusPollId / kickReadyPollId / ensureKickMountPollId pozostają aktywne
+    }
+
+    // Globalny licznik: sumuje Twitch + Kick (definicja na górze, aby uniknąć błędów widoczności)
+    function updateGlobalCounters(){
+      try{
+        const counterEl = document.getElementById('global-count');
+        if (!counterEl) return;
+        // Pobierz wiersze z obu raportów (oba używają id `report-table` w fragmentach)
+        const rows = Array.from(document.querySelectorAll('#report-table tbody tr'));
+        let viewedArr = []; let newPendingArr = [];
+        try { viewedArr = JSON.parse(localStorage.getItem('viewedClips')||'[]')||[]; } catch{}
+        try { newPendingArr = JSON.parse(localStorage.getItem('newPendingClipIds')||'[]')||[]; } catch{}
+        const viewedSet = new Set(viewedArr); const newPendingSet = new Set(newPendingArr);
+        const clipIdFromUrl = (url)=>{ try{ const u = new URL(url); let last = u.pathname.split('/').filter(Boolean).pop()||'clip'; last = last.split('?')[0]; return last.replace(/[^a-zA-Z0-9_-]/g,'')||'clip'; }catch{ return 'clip'; } };
+        let total = 0, newUnviewed = 0, viewedCount = 0;
+        rows.forEach(tr=>{
+          const cb = tr.querySelector('.clip-select');
+          const url = cb ? cb.dataset.url : (tr.querySelector('a[href]')?.getAttribute('href')||'');
+          const id = clipIdFromUrl(url);
+          total++;
+          const isViewed = viewedSet.has(id);
+          const isNewPending = newPendingSet.has(id);
+          if (isViewed) viewedCount++;
+          if (isNewPending && !isViewed) newUnviewed++;
+        });
+        counterEl.textContent = `Nowe: ${newUnviewed} / Wszystkie: ${total} • Obejrzane: ${viewedCount}`;
+      }catch{}
+    }
+
+    function formatMMSS(sec){
+      try{ sec = Math.max(0, Math.floor(Number(sec)||0)); }catch{ sec = 0; }
+      const m = Math.floor(sec/60); const s = sec%60;
+      return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    }
+
+    // Wylicz lokalnie najbliższe 10 min (00, 10, 20, 30, 40, 50)
+    function calcNextDecaminTimestamp(){
+      const now = new Date();
+      const s = now.getSeconds();
+      const ms = now.getMilliseconds();
+      const remainder = now.getMinutes() % 10;
+      let addMin = 10 - remainder;
+      // jeśli jesteśmy idealnie na kwadransie, przejdź do następnego
+      if (remainder === 0 && s === 0 && ms === 0) addMin = 10;
+      const nextMs = now.getTime() + addMin*60*1000 - s*1000 - ms;
+      return nextMs;
+    }
+
+    function updateCountdown(){
+      if (!nextRunAt){
+        if (refreshTimerEl) refreshTimerEl.textContent = '--:--';
+        return;
+      }
+      const now = Date.now();
+      let diffSec = Math.floor((nextRunAt - now) / 1000);
+      if (diffSec < 0) diffSec = 0;
+      if (refreshTimerEl) refreshTimerEl.textContent = formatMMSS(diffSec);
+      // Po dojściu do zera: zawsze przeskocz na kolejne okno odliczania,
+      // aby licznik nie "stał" na 00:00 (nawet gdy trwa generowanie).
+      if (diffSec === 0){
+        nextRunAt = calcNextDecaminTimestamp();
+        // Uruchom generowanie tylko raz, gdy nie trwa aktywny cykl
+        if (!autoGenActive && !autoTriggerStarted){
+          autoTriggerGeneration();
+        }
+      }
+    }
+
+    function startCountdown(){
+      if (countdownTimerId) clearInterval(countdownTimerId);
+      updateCountdown();
+      countdownTimerId = setInterval(updateCountdown, 1000);
+    }
+
+    async function checkReadyOnce(){
+      if (readyFetchLock) return false;
+      readyFetchLock = true;
+      try{
+        const rr = await fetch('/api/report-ready');
+        const rj = await rr.json();
+        return !!(rj && rj.ready);
+      }catch(e){ return false; }
+      finally { readyFetchLock = false; }
+    }
+
+    function stopAutoGenerationPolling(){
+      autoGenActive = false;
+      if (autoGenPollId){ clearInterval(autoGenPollId); autoGenPollId = null; }
+      if (autoGenReadyPollId){ clearInterval(autoGenReadyPollId); autoGenReadyPollId = null; }
+    }
+
+    // Kick: status polling i ładowanie raportu po gotowości
+    function startKickStatusPolling(fromUserClick){
+      console.log(`[Kick] startKickStatusPolling fromUserClick=${!!fromUserClick}`);
+      // natychmiastowy odczyt
+      (async ()=>{
+        try{
+          const r0 = await fetch('/api/report-kick-status', { cache: 'no-store' });
+          const d0 = await r0.json();
+          const p0 = d0 && d0.progress ? d0.progress : {};
+          console.log('[Kick] immediate status:', p0);
+          updateKickProgressUI(p0);
+        }catch{}
+      })();
+      // cykliczny status
+      if (kickStatusPollId) clearInterval(kickStatusPollId);
+      kickStatusPollId = setInterval(async ()=>{
+        try{
+          const r = await fetch('/api/report-kick-status', { cache: 'no-store' });
+          const d = await r.json();
+          const p = d && d.progress ? d.progress : {};
+          console.log('[Kick] status tick:', p);
+          updateKickProgressUI(p);
+          if (p.status === 'finished'){
+            clearInterval(kickStatusPollId); kickStatusPollId = null;
+            console.log('[Kick] status finished → pollKick');
+            try{ await pollKick(); }catch{}
+          }
+        }catch{}
+      }, 2000);
+      // gotowość co kilka sekund
+      if (kickReadyPollId) clearInterval(kickReadyPollId);
+      kickReadyPollId = setInterval(async ()=>{
+        try{
+          const rk = await fetch('/api/report-kick-ready', { cache: 'no-store' }).then(r=>r.json());
+          console.log('[Kick] ready tick:', rk);
+          if (rk && rk.ready){
+            clearInterval(kickReadyPollId); kickReadyPollId = null;
+            console.log('[Kick] ready=true → pollKick');
+            try{ await pollKick(); }catch{}
+          }
+        }catch{}
+      }, fromUserClick ? 3000 : 5000);
+    }
+
+    function updateKickProgressUI(p){
+      const st = p && p.status ? p.status : 'idle';
+      const total = Number(p && p.total || 0);
+      let label = '—'; let pct = 0;
+      if (st === 'scraping'){
+        label = '⏳ Skrobanie klipów…'; pct = 5;
+        if (kickProgressContainer) kickProgressContainer.style.display = 'block';
+        if (kickProgressBar) kickProgressBar.style.display = 'block';
+      } else if (st === 'generating'){
+        label = total>0 ? `🔧 Generowanie… (klipy: ${total})` : '🔧 Generowanie…';
+        pct = total>0 ? 70 : 50;
+        if (kickProgressContainer) kickProgressContainer.style.display = 'block';
+        if (kickProgressBar) kickProgressBar.style.display = 'block';
+      } else if (st === 'finished'){
+        label = '✅ Gotowe'; pct = 100;
+        if (kickProgressBar) kickProgressBar.style.display = 'none';
+        if (kickProgressContainer) kickProgressContainer.style.display = 'block';
+        if (kickFinishedHideTimeoutId) { clearTimeout(kickFinishedHideTimeoutId); }
+        kickFinishedHideTimeoutId = setTimeout(()=>{
+          if (kickProgressContainer) kickProgressContainer.style.display = 'none';
+        }, 4000);
+      } else {
+        label = '—'; pct = 0;
+        if (kickProgressContainer) kickProgressContainer.style.display = 'none';
+        if (kickProgressBar) kickProgressBar.style.display = 'none';
+      }
+      if (progressCounterKick) progressCounterKick.textContent = label;
+      if (progressFillElKick) progressFillElKick.style.width = pct + '%';
+    }
+
+    async function autoTriggerGeneration(){
+      autoGenActive = true;
+      autoTriggerStarted = true;
+      autoGenSeenActive = false; // reset global strażnika aktywności dla nowego cyklu
+      // Reset guardów fragmentu na nowy cykl
+      window.twitchFragmentLoaded = false;
+      window.twitchFragmentLoading = false;
+      // Przed startem nowego cyklu wyczyść ewentualne stare interwały pollowania
+      try { stopAllIntervals(); } catch{}
+      // Start generowania Twitch
+      try { await fetch('/api/generate-raport'); } catch{}
+      try { await fetch('/api/generate-raport-kick'); } catch(e) { console.warn('[Kick][auto] generate error:', e); }
+      // Uruchom pollowanie postępu Twitch
+      if (twitchProgressBar) twitchProgressBar.style.display = 'block';
+      if (progressCounter) { progressCounter.style.display = 'block'; progressCounter.textContent = '⏳ Przetworzono: 0 / 0'; }
+      startAutoGenerationPolling();
+      // Pollowanie Kick uruchamiaj zawsze z auto-triggera
+      try{ console.log('[Kick][auto] start status polling'); startKickStatusPolling(false); }catch(e){ console.warn('[Kick][auto] status polling start error:', e); }
+    }
+
+    async function startAutoGenerationPolling(){
+      autoGenActive = true;
+      autoGenSeenActive = false; // reset na początku cyklu auto-pollowania
+      // Pollowanie postępu tylko w trakcie generowania (co 3s)
+      if (autoGenPollId) clearInterval(autoGenPollId);
+      autoGenPollId = setInterval(pollStatus, 3000);
+      // Pollowanie gotowości raportu (co 3s)
+      if (autoGenReadyPollId) clearInterval(autoGenReadyPollId);
+      autoGenReadyPollId = setInterval(async ()=>{
+        try{
+          // Korzystaj z ostatniego statusu z pollStatus(), aby uniknąć podwójnych wywołań
+          const p = latestStatus || {};
+          if (p && p.status && p.status !== 'finished') { autoGenSeenActive = true; }
+          if (p && p.status === 'finished' && autoGenSeenActive){
+            const ready = await checkReadyOnce();
+            if (ready){
+              await loadTwitchFragmentOnce();
+            }
+          }
+        }catch{}
+      }, 3000);
+      // Kick: bez pollowania w stanie idle – wznowienie tylko po starcie cyklu
+    }
+
+    // Aktualizacja UI Twitch na podstawie statusu (bez fetch)
+    function updateTwitchProgressFromStatus(p){
+      try{
+        const processed = Number(p && p.processed || 0);
+        const total = Number(p && p.total || 0);
+        const st = p && p.status ? p.status : 'idle';
+        latestStatus = p || {};
+        if (progressCounter){
+          if (st === 'scraping' || st === 'generating' || st === 'running'){
+            progressCounter.style.display = 'block';
+            progressCounter.textContent = total>0 ? `⏳ Przetworzono: ${processed} / ${total}` : '⏳ Generowanie…';
+          } else {
+            progressCounter.style.display = 'none';
+            progressCounter.textContent = '';
+          }
+        }
+        if (progressFillEl){
+          if (twitchProgressBar) twitchProgressBar.style.display = (st==='finished' || st==='idle') ? 'none' : 'block';
+          const pct = total>0 ? Math.floor(processed*100/total) : 0;
+          progressFillEl.style.width = pct + '%';
+        }
+        if (st && st !== 'finished') { autoGenSeenActive = true; }
+      }catch{}
+    }
+
+    async function pollStatus(){
+      // Nie pollować poza aktywnym cyklem
+      if (!autoGenActive) return;
+      // Guard przed równoległymi wywołaniami /api/report-status
+      if (statusFetchLock) return;
+      statusFetchLock = true;
+      try{
+        const rs = await fetch('/api/report-status');
+        const data = await rs.json();
+        const p = (data && data.progress) ? data.progress : {};
+        latestStatus = p;
+        writeLatest(p);
+        updateTwitchProgressFromStatus(p);
+        // Oznacz aktywność cyklu gdy status jest inny niż 'finished'
+        if (p && p.status && p.status !== 'finished') {
+          autoGenSeenActive = true;
+        }
+        // Jeśli status zakończony i wcześniej widziano aktywność — wstrzyknij fragment bez ręcznego odświeżania
+        if ((p.status === 'finished') && autoGenSeenActive) {
+          try {
+            const ready = await checkReadyOnce();
+            if (ready) {
+              await loadTwitchFragmentOnce();
+            }
+          } catch{}
+        }
+      }catch(e){ /* ignore */ }
+      finally { statusFetchLock = false; }
+    }
 
     document.getElementById('btn-kick').onclick = async () => {
       if (btnKick.disabled) return;
@@ -36,9 +461,14 @@
       const prevTxt = btnKick.textContent;
       btnKick.textContent = 'Generuję…';
       spinner.style.display = 'inline-block';
+      // Wyzeruj pasek postępu Kick i uruchom pollowanie statusu
+      if (progressCounterKick) { progressCounterKick.textContent = '⏳ Generowanie…'; }
+      if (progressFillElKick) { progressFillElKick.style.width = '0%'; }
+      if (kickProgressContainer) kickProgressContainer.style.display = 'block';
+      if (kickProgressBar) kickProgressBar.style.display = 'block';
       try {
         await fetch('/api/generate-raport-kick');
-        await pollKick();
+        startKickStatusPolling(true);
       } finally {
         btnKick.disabled = false;
         btnKick.textContent = prevTxt;
@@ -47,89 +477,259 @@
     };
 
 function pollKick() {
-  return fetch('/api/report-kick-ready')
-    .then(r => r.json())
-    .then(j => {
-      if (j.ready) {
-        return fetch('/raport-kick-fragment')
-          .then(r => r.text())
-          .then(html => {
-            const kc = document.getElementById('kick-report-container');
-            kc.innerHTML = html;
-            initReportFiltersAndStats(kc);
-          });
-      } else {
-        return new Promise(res => setTimeout(res, 2000)).then(() => pollKick());
+  return fetch('/api/report-kick-ready', { cache: 'no-store' })
+    .then(r=>r.json())
+    .then(async (j) => {
+      if (j && j.ready) {
+        const bust = Date.now();
+        const html = await fetch(`/raport-kick-fragment?v=${bust}`, { cache: 'no-store' }).then(r=>r.text());
+        const kc = document.getElementById('kick-report-container');
+        if (kc) {
+          kc.innerHTML = html;
+          try { kc.style.display = 'block'; } catch{}
+          try { markNewRowsAfterInject(kc); } catch{}
+          initReportFiltersAndStats(kc);
+          // Zatrzymaj animację i pokaż 100%
+          if (kickProgressInterval) { clearInterval(kickProgressInterval); kickProgressInterval = null; }
+          if (progressFillElKick) { progressFillElKick.style.width = '100%'; }
+          if (progressCounterKick) { progressCounterKick.textContent = '✅ Gotowe'; }
+          try { updateGlobalCounters(); } catch{}
+          if (kickProgressBar) kickProgressBar.style.display = 'none';
+          if (kickFinishedHideTimeoutId) { clearTimeout(kickFinishedHideTimeoutId); }
+          kickFinishedHideTimeoutId = setTimeout(()=>{
+            if (kickProgressContainer) kickProgressContainer.style.display = 'none';
+          }, 4000);
+          // Proaktywnie zatrzymaj pollowanie Kick po wstrzyknięciu raportu
+          if (kickStatusPollId) { clearInterval(kickStatusPollId); kickStatusPollId = null; }
+          if (kickReadyPollId) { clearInterval(kickReadyPollId); kickReadyPollId = null; }
+          if (ensureKickMountPollId) { clearInterval(ensureKickMountPollId); ensureKickMountPollId = null; }
+          return true;
+        }
       }
-    });
+      return false;
+    })
+    .catch(()=>false);
 }
 
-    // 1) Odśwież streamerów
+    // 1) OdÅ›wieÅ¼ streamerÃ³w
     async function runUpdate() {
       const btn = document.getElementById('btn-update');
       if (btn.disabled) return;
       btn.disabled = true;
       const prev = btn.textContent;
-      btn.textContent = 'Odświeżam…';
+      btn.textContent = 'OdÅ›wieÅ¼amâ€¦';
       statusEl.textContent = '🔄 Odświeżanie streamerów…';
       try {
         const res = await fetch('/api/update-streamers');
         const obj = await res.json();
         statusEl.textContent = obj.message || obj.error;
       } catch (e) {
-        statusEl.textContent = 'Błąd: ' + e;
+        statusEl.textContent = 'BÅ‚Ä…d: ' + e;
       } finally {
         btn.disabled = false;
         btn.textContent = prev;
       }
     }
 
-    // 2) Generowanie raportu i pollowanie gotowości
+    // 2) Generowanie raportu i pollowanie gotowoÅ›ci
     async function runReport() {
       const btn = btnReport;
       if (btn.disabled) return;
+      // Przed ręcznym startem wyczyść wszystkie interwały pollowania
+      try { stopTwitchIntervalsOnly(); } catch{}
+      // Reset guardów fragmentu przy ręcznym starcie cyklu
+      window.twitchFragmentLoaded = false;
+      window.twitchFragmentLoading = false;
       btn.disabled = true;
       const prev = btn.textContent;
+      // Zabezpieczenie przed podwójnym uruchomieniem (zbieg z autoTriggerem)
+      autoGenActive = true;
+      autoTriggerStarted = true;
+      autoGenSeenActive = false; // wyzeruj globalny strażnik dla ręcznego cyklu
+      let hasSeenActive = false; // lokalny strażnik dla tego cyklu
       btn.textContent = 'Generuję…';
       statusEl.textContent = '🕒 Rozpoczynam generowanie…';
       spinner.style.display = 'inline-block';
+      if (progressCounter) {
+
+
+      progressCounter.style.display = 'block';
+      progressCounter.textContent = '⏳ Przetworzono: 0 / 0';
+      }
+      if (progressFillEl){ progressFillEl.style.width = '0%'; }
       try {
         await fetch('/api/generate-raport');
         statusEl.textContent = '⌛ Czekam na raport…';
-        const poll = setInterval(async () => {
-          try {
-            const r = await fetch('/api/report-ready');
-            const { ready } = await r.json();
-            if (ready) {
-              clearInterval(poll);
-              statusEl.textContent = '✅ Raport gotowy!';
-              await loadReportFragment();
-              btn.disabled = false;
-              btn.textContent = prev;
-              spinner.style.display = 'none';
-            }
-          } catch (e) {
-            console.error(e);
-          }
-        }, 4000);
+        // Używaj wyłącznie wspólnego mechanizmu auto-pollowania
+        startAutoGenerationPolling();
+        // Upewnij się, że Kick dalej pollowany podczas ręcznego cyklu Twitch
+        try { startKickStatusPolling(true); } catch(e) { console.warn('[Kick][manual] status polling start error:', e); }
       } catch (e) {
-        statusEl.textContent = 'Błąd: ' + e;
+        statusEl.textContent = 'BÅ‚Ä…d: ' + e;
         btn.disabled = false;
         btn.textContent = prev;
         spinner.style.display = 'none';
+        if (progressCounter) {
+          progressCounter.style.display = 'none';
+          progressCounter.textContent = '';
+        }
+        if (progressFillEl){ progressFillEl.style.width = '0%'; }
+        if (twitchProgressBar){ twitchProgressBar.style.display = 'none'; }
+        if (reportReadyPoll) { clearInterval(reportReadyPoll); reportReadyPoll = null; }
+        if (reportStatusPoll) { clearInterval(reportStatusPoll); reportStatusPoll = null; }
       }
     }
 
-    // 3) Pobranie i wstrzyknięcie fragmentu raportu
+    // 3) Pobranie i wstrzykniÄ™cie fragmentu raportu
     async function loadReportFragment() {
       const html = await fetch('/raport-fragment').then(r => r.text());
+      // Strażnik: wstrzyknij raport tylko, jeśli są wiersze tabeli (realne dane)
+      try {
+        const tmp = document.createElement('div');
+        tmp.innerHTML = html;
+        const hasRows = tmp.querySelectorAll('#report-table tbody tr').length > 0;
+        if (!hasRows) {
+          // Nie pokazuj pustego raportu
+          return false;
+        }
+      } catch {}
       raportContainer.innerHTML = html;
+      try { raportContainer.style.display = 'block'; } catch{}
+      try { initReportFiltersAndStats(raportContainer); } catch{}
+      // Usunięto lokalne przyciski; używamy globalnego paska i overlayu zapisanych
+      (function bindGlobalEditorButtons(){
+        const proceedFixed = document.getElementById('fallback-proceed-editor');
+        const viewSavedFixed = document.getElementById('fallback-view-saved');
+        if (proceedFixed && !proceedFixed.dataset.bound){
+          proceedFixed.dataset.bound = '1';
+          proceedFixed.addEventListener('click', (e)=>{
+            e.preventDefault();
+            if (proceedFixed.disabled) return;
+            const selected = savedAll();
+            try {
+              localStorage.setItem('pendingSelection', JSON.stringify({ clips: selected }));
+              window.location.assign('/editor');
+            } catch (e) {
+              alert('Nie udało się zapisać wyboru: ' + e);
+            }
+          });
+        }
+        if (viewSavedFixed && !viewSavedFixed.dataset.bound){
+          viewSavedFixed.dataset.bound = '1';
+          viewSavedFixed.addEventListener('click', (e)=>{
+            e.preventDefault();
+            let panel = document.getElementById('saved-clips-panel');
+            if (!panel){
+              panel = document.createElement('div');
+              panel.id = 'saved-clips-panel';
+              panel.className = 'saved-panel';
+              panel.style.display = 'none';
+              panel.style.position = 'fixed';
+              panel.style.right = '16px';
+              panel.style.bottom = '64px';
+              panel.style.background = '#fafafa';
+              panel.style.border = '1px solid #ddd';
+              panel.style.borderRadius = '6px';
+              panel.style.padding = '8px';
+              panel.style.maxWidth = '360px';
+              panel.style.zIndex = '9998';
+              document.body.appendChild(panel);
+            }
+            if (panel.style.display === 'none' || !panel.style.display){ renderSavedPanel(panel); panel.style.display = 'block'; }
+            else { panel.style.display = 'none'; }
+          });
+        }
+        updateProceedState();
+      })();
       initReportFiltersAndStats(raportContainer);
+      // Po wstrzyknięciu: oznacz NOWE (trwałe do kliknięcia) i aktualizuj pamięć
+      markNewRowsAfterInject(raportContainer);
+      try { updateGlobalCounters(); } catch{}
     }
 
-    // 4) Inicjalizacja dropdownów i aplikacja filtrów
+    // Wstrzyknięcie fragmentu Twitch tylko raz i zatrzymanie całego pollowania
+    async function loadTwitchFragmentOnce(){
+      if (window.twitchFragmentLoaded || window.twitchFragmentLoading) return false;
+      window.twitchFragmentLoading = true;
+      let ok = false;
+      try {
+        if (typeof window.loadReportFragment === 'function'){
+          ok = await window.loadReportFragment();
+        } else {
+          ok = await loadReportFragment();
+        }
+      } catch(e){ ok = false; }
+      // Niezależnie od powodzenia wstrzyknięcia — zakończ cykl i zatrzymaj pollowanie
+      try { stopTwitchIntervalsOnly(); } catch{}
+      autoGenActive = false;
+      autoTriggerStarted = false;
+      autoGenSeenActive = false;
+      try{ if (twitchProgressBar) twitchProgressBar.style.display = 'none'; }catch{}
+      try{ if (progressCounter) { progressCounter.style.display = 'none'; progressCounter.textContent = ''; } }catch{}
+      try{ if (progressFillEl) progressFillEl.style.width = '0%'; }catch{}
+      nextRunAt = calcNextDecaminTimestamp();
+      startCountdown();
+      window.twitchFragmentLoading = false;
+      window.twitchFragmentLoaded = (ok !== false);
+      return window.twitchFragmentLoaded;
+    }
+
+    // Oznaczanie nowych i obejrzanych po wstrzyknięciu fragmentu
+    function markNewRowsAfterInject(root){
+      if (!root) return;
+      // Odczytaj dotychczasowe zbiory
+      let known = [];
+      let newPending = [];
+      let viewed = [];
+      try { known = JSON.parse(localStorage.getItem('knownClipIds')||'[]')||[]; } catch{}
+      try { newPending = JSON.parse(localStorage.getItem('newPendingClipIds')||'[]')||[]; } catch{}
+      try { viewed = JSON.parse(localStorage.getItem('viewedClips')||'[]')||[]; } catch{}
+      const knownSet = new Set(known);
+      const newPendingSet = new Set(newPending);
+      const viewedSetLocal = new Set(viewed);
+
+      const rows = Array.from(root.querySelectorAll('#report-table tbody tr'));
+      const currentIds = [];
+      rows.forEach(tr=>{
+        const cb = tr.querySelector('.clip-select');
+        const url = cb ? cb.dataset.url : (tr.querySelector('a[href]')?.getAttribute('href')||'');
+        const id = window.clipIdFrom ? window.clipIdFrom(url) : url;
+        currentIds.push(id);
+      });
+      // Zaktualizuj known (dodaj bieżące id)
+      const updatedKnown = Array.from(new Set([...knownSet, ...currentIds]));
+      // NOWE = wszystkie nieobejrzane z bieżącego widoku + poprzednie, po odfiltrowaniu obejrzanych
+      const perContainerNew = currentIds.filter(id => !viewedSetLocal.has(id));
+      const updatedNewPending = Array.from(new Set([...newPendingSet, ...perContainerNew])).filter(id=>!viewedSetLocal.has(id));
+      try { localStorage.setItem('knownClipIds', JSON.stringify(updatedKnown)); } catch{}
+      try { localStorage.setItem('newPendingClipIds', JSON.stringify(updatedNewPending)); } catch{}
+
+      // Zastosuj klasy CSS w zależności od stanu
+      const updatedNewSet = new Set(updatedNewPending);
+      rows.forEach(tr=>{
+        const cb = tr.querySelector('.clip-select');
+        const url = cb ? cb.dataset.url : (tr.querySelector('a[href]')?.getAttribute('href')||'');
+        const id = window.clipIdFrom ? window.clipIdFrom(url) : url;
+        const isViewed = viewedSetLocal.has(id);
+        const isNewPending = updatedNewSet.has(id);
+        tr.classList.toggle('viewed-row', isViewed);
+        tr.classList.toggle('new-row', isNewPending && !isViewed);
+        tr.classList.toggle('new-unviewed', isNewPending && !isViewed);
+      });
+    }
+
+    // 4) Inicjalizacja dropdownÃ³w i aplikacja filtrÃ³w
 function initReportFiltersAndStats(root) {
   if (!root) return;
+
+  // Globalny stan obejrzanych i filtra
+  const hideViewedBtn = document.getElementById('btn-hide-viewed');
+  const globalCountEl = document.getElementById('global-count');
+  let viewedSet = new Set();
+  try { viewedSet = new Set(JSON.parse(localStorage.getItem('viewedClips')||'[]').filter(x=>typeof x==='string')); } catch(e){ viewedSet = new Set(); }
+  let hideViewed = false;
+  try { hideViewed = JSON.parse(localStorage.getItem('hideViewed')||'false'); } catch(e){}
+  if (hideViewedBtn){ hideViewedBtn.textContent = hideViewed ? 'Pokaż obejrzane' : 'Ukryj obejrzane'; }
 
   // 1. Toggle dropdownów tylko wewnątrz root
   root.querySelectorAll('.dropdown').forEach(dd => {
@@ -144,8 +744,43 @@ function initReportFiltersAndStats(root) {
   // 2. Pobierz wszystkie wiersze tabeli wewnątrz root
   const rows = Array.from(root.querySelectorAll('#report-table tbody tr'));
 
+  // Zaznacz jako obejrzany po kliknięciu linku
+  root.addEventListener('click', (e)=>{
+    const a = e.target.closest('a[href]');
+    if (!a) return;
+    if (!root.contains(a)) return;
+    const tr = a.closest('tr');
+    if (!tr) return;
+    const cb = tr.querySelector('.clip-select');
+    const url = cb ? cb.dataset.url : a.getAttribute('href');
+    const id = clipIdFromUrl(url);
+    if (!viewedSet.has(id)){
+      viewedSet.add(id);
+      try { localStorage.setItem('viewedClips', JSON.stringify(Array.from(viewedSet))); } catch(e){}
+    }
+    // Usuń z pending nowych jeśli został obejrzany
+    try {
+      const pending = JSON.parse(localStorage.getItem('newPendingClipIds')||'[]')||[];
+      const updated = pending.filter(x=>x!==id);
+      localStorage.setItem('newPendingClipIds', JSON.stringify(updated));
+    } catch(e){}
+    // Re-render bez reloadu (po kliknięciu i tak otwiera się karta, ale UI odświeżamy natychmiast)
+    applyFiltersAndStats();
+    try { updateGlobalCounters(); } catch{}
+  }, true);
+
   // Czy w tym widoku istnieje filtrowanie po kategoriach?
   const hasCategoryFiltering = root.querySelectorAll('.filter-category').length > 0;
+
+  // Pomocnicze: id klipu z data-url (deklaracja funkcji hoistowana)
+  function clipIdFromUrl(url){
+    try{
+      const u = new URL(url);
+      let last = u.pathname.split('/').filter(Boolean).pop()||'clip';
+      last = last.split('?')[0];
+      return last.replace(/[^a-zA-Z0-9_-]/g,'')||'clip';
+    }catch{ return 'clip'; }
+  }
 
   // 3. Funkcja filtrująca + aktualizująca statystyki
   function applyFiltersAndStats() {
@@ -162,15 +797,49 @@ function initReportFiltersAndStats(root) {
         : []
     );
 
+    let newCount = 0;
+    // Odczytaj bieżące newPending (NOWE)
+    let newPendingArr = [];
+    try { newPendingArr = JSON.parse(localStorage.getItem('newPendingClipIds')||'[]')||[]; } catch{}
+    const newPendingSet = new Set(newPendingArr);
+    // Tryb pokazywania tylko nowych
     const visible = [];
     rows.forEach(row => {
       const st = row.dataset.streamer;
       const ct = row.dataset.category;
+      // Źródło URL klipu: preferuj przycisk .add-to-editor, inaczej fallback do linku w tytule
+      const btn = row.querySelector('.add-to-editor');
+      const hrefLink = row.querySelector('a[href]');
+      const url = (btn && btn.dataset.url) ? btn.dataset.url : (hrefLink ? hrefLink.getAttribute('href') || '' : '');
+      const id = clipIdFromUrl(url);
+      const isViewed = viewedSet.has(id);
       const hideByStreamer = ignoredStreamers.has(st);
       const hideByCategory = hasCategoryFiltering ? ignoredCategories.has(ct) : false;
-      const hide = hideByStreamer || hideByCategory;
+      const hideByViewed = hideViewed && isViewed === true;
+      // Stylowanie: obejrzane i nowe
+      if (isViewed){
+        row.classList.add('viewed-row');
+        row.classList.remove('new-unviewed');
+      } else {
+        row.classList.remove('viewed-row');
+        if (row.classList.contains('new-row')) row.classList.add('new-unviewed');
+      }
+      const isNewPending = newPendingSet.has(id);
+      const hide = hideByStreamer || hideByCategory || hideByViewed;
       row.style.display = hide ? 'none' : '';
+      if (isNewPending && !isViewed) newCount++;
       if (!hide) visible.push(row);
+      // Oznaczenie NOWE w tytule
+      const titleLink = row.querySelector('a[title]');
+      if (titleLink){
+        const baseTitle = titleLink.getAttribute('title') || '';
+        const badge = ' [NOWE]';
+        if (!isViewed && !baseTitle.includes(' [NOWE]')){
+          titleLink.setAttribute('title', baseTitle + badge);
+        } else if (isViewed && baseTitle.includes(' [NOWE]')){
+          titleLink.setAttribute('title', baseTitle.replace(' [NOWE]',''));
+        }
+      }
     });
 
     // c) oblicz statystyki
@@ -201,6 +870,8 @@ function initReportFiltersAndStats(root) {
 
     const strEl = root.querySelector('#stats-streamers');
     if (strEl) strEl.textContent = topStr.map(([s,n])=>`${s} (${n})`).join(', ');
+
+    // e) lokalne liczniki zostawiamy, globalny licznik zsumujemy poniżej
   }
 
   // 4. Podłącz przyciski filtrów tylko wewnątrz root (z guardami)
@@ -210,6 +881,7 @@ function initReportFiltersAndStats(root) {
       applyFiltersAndStats();
       const ddS = root.querySelector('#dd-streamers');
       if (ddS) ddS.classList.remove('open');
+      try { updateGlobalCounters(); } catch{}
     });
   }
 
@@ -219,50 +891,591 @@ function initReportFiltersAndStats(root) {
       applyFiltersAndStats();
       const ddC = root.querySelector('#dd-categories');
       if (ddC) ddC.classList.remove('open');
+      try { updateGlobalCounters(); } catch{}
     });
   }
 
-  // 5. UI zaznaczania i przejścia do edytora (działa dla Twitch i Kick)
+  // 5. Kolejka edytora: dodawanie per klip, zapisane i przejście
   const proceedBtn = root.querySelector('#twitch-proceed-editor') || root.querySelector('#kick-proceed-editor');
-  const getCheckboxes = () => Array.from(root.querySelectorAll('.clip-select'));
-  const updateProceedState = () => {
-    if (proceedBtn) {
-      const anyChecked = getCheckboxes().some(cb => cb.checked);
-      proceedBtn.disabled = !anyChecked;
+  const viewSavedBtn = root.querySelector('#twitch-view-saved') || root.querySelector('#kick-view-saved');
+  const isTwitch = !!root.querySelector('#twitch-report-root');
+  const currentSource = isTwitch ? 'Twitch' : 'Kick';
+  // Lekki, estetyczny popup (toast) przy górze ekranu
+  function showToast(message, type='info'){
+    try{
+      let rootEl = document.getElementById('toast-root');
+      if (!rootEl){
+        rootEl = document.createElement('div');
+        rootEl.id = 'toast-root';
+        rootEl.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:9999;display:flex;flex-direction:column;gap:8px;';
+        document.body.appendChild(rootEl);
+      }
+      const t = document.createElement('div');
+      t.textContent = message;
+      t.style.cssText = 'background:#1f2937;color:#fff;padding:8px 12px;border-radius:8px;box-shadow:0 8px 20px rgba(0,0,0,0.20);border:1px solid rgba(255,255,255,0.08);font-size:14px;opacity:0;transform:translateY(-6px);transition:opacity .25s ease, transform .25s ease;';
+      if (type==='success'){ t.style.background = '#14532d'; t.style.borderColor = '#166534'; }
+      if (type==='error'){ t.style.background = '#7f1d1d'; t.style.borderColor = '#991b1b'; }
+      rootEl.appendChild(t);
+      requestAnimationFrame(()=>{ t.style.opacity = '1'; t.style.transform = 'translateY(0)'; });
+      setTimeout(()=>{
+        t.style.opacity = '0';
+        t.style.transform = 'translateY(-6px)';
+        setTimeout(()=>{ try{ t.remove(); }catch{} }, 300);
+      }, 2500);
+    }catch{}
+  }
+  const readSavedClips = () => { try { return JSON.parse(localStorage.getItem('savedClips')||'[]')||[]; } catch { return []; } };
+  const writeSavedClips = (arr) => { try { localStorage.setItem('savedClips', JSON.stringify(arr)); } catch {} };
+  // Wspólna kolejka klipów (Twitch + Kick)
+  // Zapisy pozostają z polem source, ale operacje UI działają na całej liście
+    const savedAll = () => readSavedClips();
+    const clipIdFrom = (url)=>{ try{ const u = new URL(url); let last = u.pathname.split('/').filter(Boolean).pop()||url; return last.split('?')[0]; }catch{ return url; } };
+    const getProceedBtn = () => document.querySelector('#raport-container #twitch-proceed-editor');
+    const updateProceedState = () => {
+      const disabled = savedAll().length===0;
+      const localProceed = getProceedBtn();
+      if (localProceed) localProceed.disabled = disabled;
+      const fab = document.getElementById('proceed-fab');
+      if (fab) { fab.disabled = disabled; }
+      const proceedFixed = document.getElementById('proceed-editor-fixed');
+      if (proceedFixed) proceedFixed.disabled = disabled;
+      const proceedFallback = document.getElementById('fallback-proceed-editor');
+      if (proceedFallback) proceedFallback.disabled = disabled;
+    };
+
+    // Global: panel zapisanych (używany przez fallback i lokalny panel)
+    function renderSavedPanel(panel){
+      if (!panel) return;
+      const clips = savedAll();
+      if (!clips.length){
+        panel.innerHTML = '<div class="hint">Brak zapisanych klipów.</div>';
+      } else {
+        const items = clips.map(c=>`<li data-url="${c.url}"><a href="${c.url}" target="_blank">${(c.title||c.url).replace(/"/g,'&quot;')}</a> <span class="hint">(${c.broadcaster||'?'}${c.source?' • '+c.source:''})</span> <button class="btn btn-small remove-saved" data-url="${c.url}">Usuń</button></li>`).join('');
+        panel.innerHTML = `<div style="margin-bottom:6px;"><strong>Zapisane klipy (${clips.length}):</strong></div><ul style="margin:0; padding-left:20px;">${items}</ul>`;
+      }
     }
-  };
-  if (proceedBtn) {
-    root.addEventListener('change', (e) => {
-      if (e.target && e.target.classList && e.target.classList.contains('clip-select')) {
-        updateProceedState();
+    // Uczyń najważniejsze funkcje dostępne globalnie, aby uniknąć ReferenceError
+    try {
+      window.readSavedClips = readSavedClips;
+      window.writeSavedClips = writeSavedClips;
+      window.savedAll = savedAll;
+      window.renderSavedPanel = renderSavedPanel;
+      window.clipIdFrom = clipIdFrom;
+    } catch {}
+
+    
+
+    // Global fallback: oznaczanie obejrzanych po kliknięciu linku w tabeli
+    document.addEventListener('click', (e)=>{
+      const a = e.target.closest('#raport-container #report-table a[href], #kick-report-container #report-table a[href]');
+      if (!a) return;
+      const href = a.getAttribute('href')||'';
+      const id = (window.clipIdFrom ? window.clipIdFrom(href) : href);
+      let viewedSet = new Set();
+      try{ viewedSet = new Set(JSON.parse(localStorage.getItem('viewedClips')||'[]')); }catch{}
+      if (!viewedSet.has(id)){
+        viewedSet.add(id);
+        try{ localStorage.setItem('viewedClips', JSON.stringify(Array.from(viewedSet))); }catch{}
       }
+      try { if (typeof applyFiltersAndStats === 'function') applyFiltersAndStats(); } catch {}
+      try { markViewedRowsGeneric(); } catch{}
+      try { updateGlobalCounters(); } catch{}
+    }, true);
+
+    // Uniwersalne odświeżenie klas obejrzanych dla Twitch i Kick
+    function markViewedRowsGeneric(){
+      // Odczyt aktualnego stanu
+      let viewedArr = [];
+      try { viewedArr = JSON.parse(localStorage.getItem('viewedClips')||'[]')||[]; } catch {}
+      const viewedSet = new Set(viewedArr);
+      let newPendingArr = [];
+      try { newPendingArr = JSON.parse(localStorage.getItem('newPendingClipIds')||'[]')||[]; } catch{}
+      const newPendingSet = new Set(newPendingArr);
+      let hideViewed = false;
+      try { hideViewed = JSON.parse(localStorage.getItem('hideViewed')||'false'); } catch{}
+      let showOnlyNew = false;
+      try { showOnlyNew = JSON.parse(localStorage.getItem('showOnlyNew')||'false'); } catch{}
+      ['#raport-container', '#kick-report-container'].forEach(rootSel=>{
+        const root = document.querySelector(rootSel);
+        if (!root) return;
+        const rows = root.querySelectorAll('#report-table tbody tr');
+        rows.forEach(row=>{
+          const btn = row.querySelector('.add-to-editor');
+          const hrefLink = row.querySelector('a[href]');
+          const url = (btn && btn.dataset.url) ? btn.dataset.url : (hrefLink ? hrefLink.getAttribute('href')||'' : '');
+          const id = window.clipIdFrom ? window.clipIdFrom(url) : url;
+          const isViewed = viewedSet.has(id);
+          const isNewPending = newPendingSet.has(id);
+          // Aktualizuj klasy, bez ingerencji w display (logikę ukrywania robi applyFiltersAndStats)
+          row.classList.toggle('viewed-row', isViewed);
+          row.classList.toggle('new-row', isNewPending && !isViewed);
+          row.classList.toggle('new-unviewed', isNewPending && !isViewed);
+          // Nie zmieniaj bezpośrednio row.style.display tutaj, aby nie nadpisać filtrów streamer/kategoria
+        });
+      });
+    }
+
+    // Fallback: pokaż/ukryj globalne przyciski, gdy nie ma lokalnego przycisku w raporcie
+    function toggleFallbackControls(show){
+      const fc = document.getElementById('fallback-editor-controls');
+      if (!fc) return;
+      fc.style.display = show ? 'flex' : 'none';
+      updateProceedState();
+    }
+
+    // Podpięcie zdarzeń dla fallback przycisków
+    (function bindFallbackControls(){
+      const proceedFallback = document.getElementById('fallback-proceed-editor');
+      const viewSavedFallback = document.getElementById('fallback-view-saved');
+      if (proceedFallback && !proceedFallback.dataset.bound){
+        proceedFallback.dataset.bound = '1';
+        proceedFallback.addEventListener('click', (e)=>{
+          e.preventDefault();
+          if (proceedFallback.disabled) return;
+          const selected = savedAll();
+          try {
+            localStorage.setItem('pendingSelection', JSON.stringify({ clips: selected }));
+            window.location.assign('/editor');
+          } catch (e) {
+            alert('Nie udało się zapisać wyboru: ' + e);
+          }
+        });
+      }
+      if (viewSavedFallback && !viewSavedFallback.dataset.bound){
+        viewSavedFallback.dataset.bound = '1';
+        viewSavedFallback.addEventListener('click', (e)=>{
+          e.preventDefault();
+          let panel = document.getElementById('saved-clips-panel');
+          if (!panel){
+            panel = document.createElement('div');
+            panel.id = 'saved-clips-panel';
+            panel.className = 'saved-panel';
+            panel.style.display = 'none';
+            panel.style.position = 'fixed';
+            panel.style.right = '16px';
+            panel.style.bottom = '64px';
+            panel.style.background = '#fafafa';
+            panel.style.border = '1px solid #ddd';
+            panel.style.borderRadius = '6px';
+            panel.style.padding = '8px';
+            panel.style.maxWidth = '360px';
+            panel.style.zIndex = '9998';
+            document.body.appendChild(panel);
+          }
+          if (panel.style.display === 'none' || !panel.style.display){ renderSavedPanel(panel); panel.style.display = 'block'; }
+          else { panel.style.display = 'none'; }
+        });
+      }
+      updateProceedState();
+    })();
+    // Jeśli globalny pasek istnieje, upewnij się, że ma podpięte zdarzenia
+    (function ensureFixedBarEvents(){
+      const proceedFixed = document.getElementById('proceed-editor-fixed');
+      const viewSavedFixed = document.getElementById('view-saved-fixed');
+      if (proceedFixed && !proceedFixed.dataset.bound){
+        proceedFixed.dataset.bound = '1';
+        proceedFixed.addEventListener('click', (e)=>{
+          e.preventDefault();
+          if (proceedFixed.disabled) return;
+          const selected = savedAll();
+          try { localStorage.setItem('pendingSelection', JSON.stringify({ clips: selected })); window.location.assign('/editor'); }
+          catch (e) { alert('Nie udało się zapisać wyboru: ' + e); }
+        });
+      }
+      if (viewSavedFixed && !viewSavedFixed.dataset.bound){
+        viewSavedFixed.dataset.bound = '1';
+        viewSavedFixed.addEventListener('click', (e)=>{
+          e.preventDefault();
+          let panel = document.querySelector('#raport-container #saved-clips-panel') || document.getElementById('saved-clips-panel');
+          if (!panel){
+            panel = document.createElement('div');
+            panel.id = 'saved-clips-panel';
+            panel.className = 'saved-panel';
+            panel.style.display = 'none';
+            panel.style.position = 'fixed';
+            panel.style.right = '16px';
+            panel.style.bottom = '64px';
+            panel.style.background = '#fafafa';
+            panel.style.border = '1px solid #ddd';
+            panel.style.borderRadius = '6px';
+            panel.style.padding = '8px';
+            panel.style.maxWidth = '360px';
+            panel.style.zIndex = '9998';
+            document.body.appendChild(panel);
+          }
+          if (panel.style.display === 'none' || !panel.style.display){ renderSavedPanel(panel); panel.style.display = 'block'; }
+          else { panel.style.display = 'none'; }
+        });
+      }
+      updateProceedState();
+    })();
+
+    // Nowy globalny handler: przyciski ➕/✖ w kolumnie „Akcja” (Twitch + Kick)
+    (function bindGlobalAddRemove(){
+      function detectSource(url){
+        try {
+          const u = new URL(url, window.location.origin);
+          const h = (u.hostname||'').toLowerCase();
+          if (h.includes('kick.com')) return 'Kick';
+          if (h.includes('twitch.tv') || h.includes('clips.twitch.tv')) return 'Twitch';
+        } catch {}
+        return '';
+      }
+      function syncButtons(url, added){
+        try{
+          document.querySelectorAll(`.add-to-editor[data-url="${url}"]`).forEach(b=>{
+            b.classList.toggle('added', !!added);
+            b.textContent = added ? '✖' : '➕';
+            b.style.minWidth = '28px';
+            b.style.textAlign = 'center';
+          });
+        }catch{}
+      }
+      function refreshSavedPanelIfOpen(){
+        try{
+          const panel = document.getElementById('saved-clips-panel');
+          if (panel && panel.style.display !== 'none'){ renderSavedPanel(panel); }
+        }catch{}
+      }
+      // Guard: nie dopuszczaj do wielokrotnego bindowania handlera
+      if (!window.__queueToggleBound){
+        window.__queueToggleBound = true;
+        const onDocClickToggle = (e)=>{
+          const btn = e.target.closest('.add-to-editor');
+          if (!btn) return;
+          e.preventDefault();
+          // zatrzymaj propagację, aby uniknąć ewentualnych dubli
+          if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+          // Globalny deduplikator: ignoruj kolejne kliknięcie tego samego klipu w krótkim oknie czasowym
+          const urlGuard = btn.dataset.url || '';
+          const idGuard = clipIdFrom(urlGuard);
+          try{
+            if (!window.__toggleGuard) window.__toggleGuard = new Map();
+            const last = window.__toggleGuard.get(idGuard) || 0;
+            const now = performance.now ? performance.now() : Date.now();
+            if (now - last < 300) return; // zbyt szybko – potraktuj jako duplikat
+            window.__toggleGuard.set(idGuard, now);
+          }catch{}
+          // Lokalny busy-guard na sam przycisk (dla bezpieczeństwa)
+          if (btn.dataset.busy) return;
+          btn.dataset.busy = '1';
+          setTimeout(()=>{ try { delete btn.dataset.busy; } catch{} }, 150);
+
+          const url = btn.dataset.url || '';
+          const broadcaster = btn.dataset.broadcaster || '';
+          const title = btn.dataset.title || '';
+          const id = clipIdFrom(url);
+          let saved = readSavedClips();
+          const exists = saved.some(x=> clipIdFrom(x.url)===id);
+          if (exists){
+            saved = saved.filter(x=> clipIdFrom(x.url)!==id);
+            writeSavedClips(saved);
+            syncButtons(url, false);
+            try{ showToast('Usunięto z kolejki', 'success'); }catch{}
+          } else {
+            const source = detectSource(url);
+            saved.push({ url, broadcaster, title, source });
+            writeSavedClips(saved);
+            syncButtons(url, true);
+            try{ showToast('Dodano do kolejki edytora', 'success'); }catch{}
+          }
+          refreshSavedPanelIfOpen();
+          updateProceedState();
+        };
+        document.addEventListener('click', onDocClickToggle);
+        // Silny guard: usuwaj i ponownie podpinaj handler przy każdej pełnej wymianie fragmentu raportu,
+        // aby uniknąć dublowania w sytuacjach dynamicznego montowania (generowanie raportu Twitch/Kick)
+        const originalLoadReportFragment = window.loadReportFragment;
+        if (typeof originalLoadReportFragment === 'function'){
+          window.loadReportFragment = async function(){
+            // Zdejmij nasłuch przed pełną wymianą fragmentu
+            try{ document.removeEventListener('click', onDocClickToggle); }catch{}
+            let res;
+            try{
+              res = await originalLoadReportFragment();
+            } finally {
+              // Przywróć nasłuch ZAWSZE, nawet jeśli wystąpi błąd/abort
+              try{ document.addEventListener('click', onDocClickToggle); }catch{}
+            }
+            return res;
+          };
+        }
+        const originalPollKick = window.pollKick;
+        if (typeof originalPollKick === 'function'){
+          window.pollKick = async function(){
+            try{ document.removeEventListener('click', onDocClickToggle); }catch{}
+            let v;
+            try{
+              v = await originalPollKick();
+            } finally {
+              try{ document.addEventListener('click', onDocClickToggle); }catch{}
+            }
+            return v;
+          };
+        }
+      }
+    })();
+  // Pasywna synchronizacja UI dla nieliderów: nasłuch zmian latestStatus w localStorage
+  try{
+    window.addEventListener('storage', (e)=>{
+      try{
+        if (e && e.key === LATEST_STATUS_KEY){
+          const p = JSON.parse(e.newValue||'{}');
+          updateTwitchProgressFromStatus(p);
+        }
+      }catch{}
     });
+    // Jednorazowa aktualizacja z ostatniego stanu (jeśli istnieje)
+    try{ const p0 = readLatest(); if (p0 && p0.status){ updateTwitchProgressFromStatus(p0); } }catch{}
+  }catch{}
+  // Inicjalna synchronizacja ikon +/✖ z zapisanymi klipami
+  (function initAddButtons(){
+    try{
+      const saved = savedAll();
+      document.querySelectorAll('.add-to-editor').forEach(b=>{
+        const id = clipIdFrom(b.dataset.url);
+        const exists = saved.some(x=>clipIdFrom(x.url)===id);
+        if (exists){ b.classList.add('added'); b.textContent = '✖'; }
+        else { b.classList.remove('added'); b.textContent = '➕'; }
+      });
+    }catch{}
+  })();
+  // Podpinanie lokalnego przycisku po wstrzyknięciu fragmentu Twitch
+
+  // 5b. Panel zapisanych + usuwanie (panel lokalny w Twitch fragmencie)
+  // Dodawanie pojedynczego klipu z wiersza tabeli
+  // (usunięto: lokalny handler kliknięć .add-to-editor)
+
+  // (usunięto: efekty hover dla .add-to-editor)
+  // Usuwanie z panelu zapisanych
+  root.addEventListener('click', (e)=>{
+    const rm = e.target.closest('.remove-saved');
+    if (!rm) return;
+    e.preventDefault();
+    const url = rm.dataset.url;
+    const all = readSavedClips();
+    // Usuwamy po id klipu (niezależnie od źródła), aby kolejka była globalna
+    const filtered = all.filter(c=>clipIdFrom(c.url) !== clipIdFrom(url));
+    writeSavedClips(filtered);
+    // Odśwież panel tylko jeśli jest widoczny
+    try{
+      const panel = document.getElementById('saved-clips-panel');
+      if (panel && panel.style.display !== 'none'){ renderSavedPanel(panel); }
+    }catch{}
     updateProceedState();
-    proceedBtn.addEventListener('click', (e)=>{
-      e.preventDefault();
-      if (proceedBtn.disabled) return;
-      const selected = getCheckboxes().filter(cb=>cb.checked).map(cb=>({
-        url: cb.dataset.url,
-        broadcaster: cb.dataset.broadcaster,
-        title: cb.dataset.title
-      }));
-      try {
-        // Zapisz lokalnie i przejdź do edytora. POST zrobimy na stronie edytora.
-        localStorage.setItem('pendingSelection', JSON.stringify({ clips: selected }));
-        window.location.assign('/editor');
-      } catch (e) {
-        alert('Nie udało się zapisać wyboru: ' + e);
-      }
+    try{
+      // Odblokuj wszystkie odpowiadające przyciski w obu raportach
+      document.querySelectorAll(`.add-to-editor[data-url="${url}"]`).forEach(rowBtn=>{
+        rowBtn.classList.remove('added');
+        rowBtn.textContent = '➕';
+      });
+    }catch{}
+  });
+  // Globalny overlay: obsługa usuwania zapisanych poza raportem Twitch/Kick
+  document.addEventListener('click', (e)=>{
+    const rm = e.target.closest('.remove-saved');
+    if (!rm) return;
+    // jeśli klik był wewnątrz root, został już obsłużony powyżej
+    if (root.contains(rm)) return;
+    e.preventDefault();
+    const url = rm.dataset.url;
+    const all = readSavedClips();
+    const filtered = all.filter(c=>clipIdFrom(c.url) !== clipIdFrom(url));
+    writeSavedClips(filtered);
+    showToast('Usunięto z kolejki', 'success');
+    try{
+      document.querySelectorAll(`.add-to-editor[data-url="${url}"]`).forEach(rowBtn=>{
+        rowBtn.classList.remove('added');
+        rowBtn.textContent = '➕';
+      });
+    }catch{}
+    try{
+      const panel = document.getElementById('saved-clips-panel');
+      if (panel && panel.style.display !== 'none'){ renderSavedPanel(panel); }
+    }catch{}
+    updateProceedState();
+  });
+  // Przycisk "Pokaż zapisane" lokalny będzie podpinany po wstrzyknięciu
+
+  // 6. Reakcja na przycisk Ukryj/Pokaż obejrzane
+  if (hideViewedBtn){
+    hideViewedBtn.addEventListener('click', ()=>{
+      hideViewed = !hideViewed;
+      try{ localStorage.setItem('hideViewed', JSON.stringify(hideViewed)); }catch(e){}
+      hideViewedBtn.textContent = hideViewed ? 'Pokaż obejrzane' : 'Ukryj obejrzane';
+      try { if (typeof applyFiltersAndStats === 'function') applyFiltersAndStats(); } catch{}
+      try { markViewedRowsGeneric(); } catch{}
+      try { updateGlobalCounters(); } catch{}
     });
   }
 
-  // 6. Pierwsze wyliczenie
+  // Przycisk "Pokaż tylko nowe" / "Pokaż wszystkie"
+  // usunięto przycisk trybu „tylko nowe”, pozostaje filtr obejrzanych
+
+  // Floating FAB: pokaż przycisk "Dalej do edytora" w prawym dolnym rogu, gdy lokalny przycisk niewidoczny
+  function setupProceedFabFor(localBtn){
+    let fab = document.getElementById('proceed-fab');
+    if (!fab){
+      fab = document.createElement('button');
+      fab.id = 'proceed-fab';
+      fab.className = 'btn fab-proceed';
+      fab.textContent = '➡️ Dalej do edytora';
+      fab.style.display = 'none';
+      document.body.appendChild(fab);
+      fab.addEventListener('click', (e)=>{
+        e.preventDefault();
+        if (fab.disabled) return;
+        const selected = savedAll();
+        try {
+          localStorage.setItem('pendingSelection', JSON.stringify({ clips: selected }));
+          window.location.assign('/editor');
+        } catch (e) {
+          alert('Nie udało się zapisać wyboru: ' + e);
+        }
+      });
+    }
+    if (!localBtn){ fab.style.display = 'none'; return; }
+    try { if (window._fabObserver) { window._fabObserver.disconnect(); } } catch{}
+    const io = new IntersectionObserver((entries)=>{
+      const visible = entries.some(en=>en.isIntersecting);
+      fab.style.display = (!visible) ? 'block' : 'none';
+      fab.disabled = savedAll().length===0;
+    }, { threshold: 0.3 });
+    io.observe(localBtn);
+    window._fabObserver = io;
+    updateProceedState();
+  }
+
+  // 7. Pierwsze wyliczenie
   applyFiltersAndStats();
+  updateGlobalCounters();
 }
 
-    // Podłączamy eventy do przycisków
+  // (usunięto zduplikowaną definicję updateGlobalCounters; funkcja jest zdefiniowana na górze skryptu)
+
+    // PodÅ‚Ä…czamy eventy do przyciskÃ³w
     document.getElementById('btn-update').addEventListener('click', runUpdate);
     document.getElementById('btn-report').addEventListener('click', runReport);
+    // Auto-odświeżanie: całkowicie lokalny timer bez zapytań do backendu
+    window.addEventListener('load', async ()=>{
+      console.log('[Kick] window.load: start');
+      nextRunAt = calcNextDecaminTimestamp();
+      startCountdown();
+      // Nie sprawdzaj gotowości Twitch na starcie; ograniczamy wywołania API
+      // (fragment Twitch zostanie załadowany dopiero po generowaniu)
+      // UWAGA: Na starcie nie odpytywać Kick (status/ready). Uruchamiamy tylko
+      // lokalny licznik i Twitch fragment (jeśli gotowy). Kick odpytujemy dopiero
+      // gdy użytkownik kliknie lub gdy timer dojdzie do zera (autoTriggerGeneration).
+      // Wymuś ukrycie UI Kick na starcie (bez generowania)
+      try{
+        if (kickProgressContainer) kickProgressContainer.style.display = 'none';
+        if (kickProgressBar) kickProgressBar.style.display = 'none';
+        if (progressCounterKick) progressCounterKick.textContent = '—';
+      }catch{}
+      // Zaktualizuj globalny licznik po starcie (guard na istnienie funkcji)
+      try { if (typeof updateGlobalCounters === 'function') updateGlobalCounters(); } catch {}
+      // Przywróć pasek postępu po odświeżeniu na podstawie ostatniego statusu
+      try {
+        const persisted = readLatest();
+        const st = persisted && persisted.status ? persisted.status : 'idle';
+        if (st === 'scraping' || st === 'generating' || st === 'running'){
+          // Wznowienie cyklu: pokaż pasek i uruchom wspólne pollowanie
+          autoGenActive = true;
+          autoTriggerStarted = true; // zapobiegaj podwójnemu startowi
+          autoGenSeenActive = true;
+          try { updateTwitchProgressFromStatus(persisted); } catch{}
+          try{ if (twitchProgressBar) twitchProgressBar.style.display = 'block'; }catch{}
+          if (autoGenPollId) clearInterval(autoGenPollId);
+          if (autoGenReadyPollId) clearInterval(autoGenReadyPollId);
+          startAutoGenerationPolling();
+        } else if (st === 'finished') {
+          // Jeśli zakończone: spróbuj wstrzyknąć utrwalony raport bez pollowania
+          try {
+            const isReady = await checkReadyOnce();
+            if (isReady) { await loadTwitchFragmentOnce(); }
+          } catch{}
+          autoGenActive = false;
+          autoTriggerStarted = false;
+          autoGenSeenActive = false;
+          try{ if (twitchProgressBar) twitchProgressBar.style.display = 'none'; }catch{}
+          try{ if (progressCounter) { progressCounter.style.display = 'none'; progressCounter.textContent = ''; } }catch{}
+          try{ if (progressFillEl) progressFillEl.style.width = '0%'; }catch{}
+        } else {
+          // Idle: licz wyłącznie lokalny countdown, bez pollowania backendu
+          autoGenActive = false;
+          autoTriggerStarted = false;
+          autoGenSeenActive = false;
+          try{ if (twitchProgressBar) twitchProgressBar.style.display = 'none'; }catch{}
+          try{ if (progressCounter) { progressCounter.style.display = 'none'; progressCounter.textContent = ''; } }catch{}
+          try{ if (progressFillEl) progressFillEl.style.width = '0%'; }catch{}
+        }
+      } catch {}
+      // Fallback: jeśli lokalny przycisk Twitch nie istnieje → pokaż globalne przyciski
+      try{
+        const hasLocalProceed = !!document.querySelector('#raport-container #twitch-proceed-editor');
+        toggleFallbackControls(true);
+      }catch{}
+      // Strażnik po reloadzie: jeśli raport Twitch jest gotowy, a kontener pusty — dociągnij fragment
+      try {
+        if (ensureTwitchMountPollId) clearInterval(ensureTwitchMountPollId);
+        ensureTwitchMountPollId = setInterval(async ()=>{
+          try {
+            const tc = document.getElementById('raport-container');
+            const hasContent = !!(tc && tc.innerHTML && tc.innerHTML.trim().length);
+            if (!autoGenActive && !hasContent) {
+              const isReady = await checkReadyOnce();
+              if (isReady) {
+                const injected = await loadTwitchFragmentOnce();
+                if (injected && ensureTwitchMountPollId) { clearInterval(ensureTwitchMountPollId); ensureTwitchMountPollId = null; }
+              }
+            }
+          } catch {}
+        }, 3000);
+      } catch {}
+      // Strażnik po reloadzie: Kick – jeśli gotowy i kontener pusty, dociągnij fragment bez ręcznego odświeżania
+      try {
+        if (ensureKickMountPollId) clearInterval(ensureKickMountPollId);
+        ensureKickMountPollId = setInterval(async ()=>{
+          try {
+            const kc = document.getElementById('kick-report-container');
+            const hasKickContent = !!(kc && kc.innerHTML && kc.innerHTML.trim().length);
+            if (!hasKickContent) {
+              const rk = await fetch('/api/report-kick-ready', { cache: 'no-store' }).then(r=>r.json());
+              if (rk && rk.ready) {
+                const bust = Date.now();
+                const htmlK = await fetch(`/raport-kick-fragment?v=${bust}`, { cache: 'no-store' }).then(r=>r.text());
+                // Pokaż tylko jeśli są wiersze z danymi
+                let canShowKick = false;
+                try {
+                  const tmpK = document.createElement('div');
+                  tmpK.innerHTML = htmlK;
+                  canShowKick = tmpK.querySelectorAll('#report-table tbody tr').length > 0;
+                } catch {}
+                if (kc && canShowKick) {
+                  kc.innerHTML = htmlK;
+                  try { kc.style.display = 'block'; } catch{}
+                  try { markNewRowsAfterInject(kc); } catch{}
+                  initReportFiltersAndStats(kc);
+                  try { updateGlobalCounters(); } catch{}
+                  if (ensureKickMountPollId) { clearInterval(ensureKickMountPollId); ensureKickMountPollId = null; }
+                }
+              }
+            }
+          } catch {}
+        }, 3000);
+      } catch {}
+      try {
+        // Kick: po załadowaniu strony uruchom tylko pollowanie statusu,
+        // bez natychmiastowego wstrzykiwania starego raportu.
+        try { startKickStatusPolling(false); } catch{}
+        
+      } catch {}
+      // Usunięto fallback stałego paska; wykorzystujemy tylko lokalny przycisk + FAB
+    });
   </script>
-</body>
-</html>
+  <script>
+    // Logika lidera wyłączona — wszystkie karty działają samodzielnie
+  </script>
+  
+  </body>
+  </html>

@@ -26,14 +26,11 @@
   </div>
 </div>
 
-<div style="margin: 8px 0;">
-  <button id="kick-proceed-editor" class="btn" disabled>➡️ Dalej do edytora (wybrane)</button>
-</div>
-
+{# Kick: ukrywamy przyciski Dalej/Pokaż zapisane. Panel zapisanych pozostaje tylko w Twitch. #}
 <table id="report-table">
   <thead>
     <tr>
-      <th>Wybierz</th>
+      <th>Akcja</th>
       <th>Streamer</th>
       <th>Tytuł</th>
       <th>Wyświetlenia</th>
@@ -42,11 +39,16 @@
   </thead>
   <tbody>
   {% for c in clips %}
-    <tr data-streamer="{{ c.broadcaster }}">
+    <tr data-streamer="{{ c.broadcaster }}" class="{% if c.broadcaster|lower in highlighted_streamers %}featured-streamer{% endif %}">
       <td>
-        <input type="checkbox" class="clip-select" data-url="{{ c.url }}" data-broadcaster="{{ c.broadcaster }}" data-title="{{ c.title }}">
+        <button class="btn-icon icon-toggle add-to-editor" title="Dodaj/Usuń" data-url="{{ c.url }}" data-broadcaster="{{ c.broadcaster }}" data-title="{{ c.title }}">➕</button>
       </td>
-      <td>{{ c.broadcaster }}</td>
+      <td>
+        {{ c.broadcaster }}
+        {% if c.broadcaster in highlighted_streamers %}
+          <span class="badge-featured" title="Wyróżniony">⭐</span>
+        {% endif %}
+      </td>
       <td>
         <a href="{{ c.url }}" target="_blank" title="{{ c.title }}">
           {%- set t = c.title -%}

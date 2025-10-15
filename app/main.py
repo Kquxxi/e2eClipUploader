@@ -35,6 +35,45 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DATA_DIR = os.path.abspath(os.getenv('DATA_DIR', PROJECT_ROOT))
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Globalny handler wyjątków: dla ścieżek API zawsze zwracaj JSON zamiast HTML
+@app.errorhandler(Exception)
+def _json_errors_for_api(e):
+    # Jeśli to HTTPException, zachowaj kod odpowiedzi; inaczej 500
+    status_code = 500
+    if isinstance(e, HTTPException):
+        try:
+            status_code = int(getattr(e, 'code', 500) or 500)
+        except Exception:
+            status_code = 500
+    # Dla ścieżek /api/* zwracaj JSON (aby front nie dostawał HTML "<!DOCTYPE ...")
+    try:
+        path = request.path or ''
+    except Exception:
+        path = ''
+    if isinstance(path, str) and path.startswith('/api/'):
+        payload = {
+            'ok': False,
+            'error': str(e),
+            'type': e.__class__.__name__,
+        }
+        # Dodaj skrócony traceback dla diagnostyki (bez zasypywania odpowiedzi)
+        try:
+            import traceback
+            tb = traceback.format_exc()
+            if isinstance(tb, str):
+                payload['traceback'] = tb[-2000:]
+        except Exception:
+            pass
+        resp = jsonify(payload)
+        try:
+            resp.headers['Cache-Control'] = 'no-store'
+            resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+        except Exception:
+            pass
+        return resp, status_code
+    # Poza /api/* pozwól działać domyślnemu handlerowi (HTML)
+    raise e
+
 # Allow importing pipeline.transcribe.adapter without installing as package
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -42,6 +81,9 @@ try:
     from pipeline.transcribe.adapter import transcribe_srt as _transcribe_srt
 except Exception:
     _transcribe_srt = None
+
+# --- global scheduler instance reference (for schedule-info endpoint) ---
+scheduler_instance = None
 def get_data_path(*parts: str) -> str:
     return os.path.join(DATA_DIR, *parts)
 
@@ -74,7 +116,8 @@ def file_lock(lock_path: str):
 
 def run_script(script_rel_path: str):
     script = _abs_path(script_rel_path)
-    return subprocess.run([sys.executable, script], capture_output=True, text=True, check=True)
+    # Forward child process output to server stdout/stderr for visibility
+    return subprocess.run([sys.executable, script], text=True, check=True)
 
 # --- scheduled jobs ---
 def job_update_streamers():
@@ -85,15 +128,25 @@ def job_update_streamers():
 
 
 def job_generate_twitch_report():
-    lock_path = get_data_path('generate_raport.lock')
+    # Ensure organized directory exists
+    os.makedirs(get_data_path('reports', 'twitch'), exist_ok=True)
+    lock_path = get_data_path('reports', 'twitch', 'generate_raport.lock')
+    # Guard: remove stale lock (>20 min) to prevent permanent blocking
+    try:
+        if os.path.exists(lock_path):
+            st = os.stat(lock_path)
+            age_sec = time.time() - st.st_mtime
+            if age_sec > 20 * 60:
+                os.remove(lock_path)
+                print('[twitch] removed stale lock (>20 min)')
+    except Exception:
+        pass
     with file_lock(lock_path) as acquired:
         if not acquired:
             print('[lock] generate_raport already running; skipping.')
             return
-        # usuwamy stary raport DOPIERO po przejęciu locka
-        out_html = get_data_path('raport.html')
-        if os.path.exists(out_html):
-            os.remove(out_html)
+        # Nie usuwaj starego raportu – nowy plik nadpisze go atomowo.
+        # Dzięki temu stary raport pozostaje widoczny, dopóki nie powstanie nowy.
         try:
             run_script('generate_raport.py')
         except CalledProcessError as e:
@@ -101,22 +154,93 @@ def job_generate_twitch_report():
 
 
 def job_refresh_kick_and_report():
+    print('[kick] job_refresh_kick_and_report: start')
     # ensure kick subdir exists inside DATA_DIR
     os.makedirs(get_data_path('kick'), exist_ok=True)
     lock_path = get_data_path('kick', 'raport_kick.lock')
+    # Guard: remove stale lock (>30 min) to prevent permanent blocking
+    try:
+        if os.path.exists(lock_path):
+            st = os.stat(lock_path)
+            age_sec = time.time() - st.st_mtime
+            if age_sec > 30*60:
+                os.remove(lock_path)
+                print('[kick] removed stale lock (>30 min)')
+    except Exception:
+        pass
     with file_lock(lock_path) as acquired:
         if not acquired:
             print('[lock] kick scrape/report already running; skipping.')
             return
-        # usuwamy stary raport Kick po przejęciu locka
-        out_html = get_data_path('kick', 'raport_kick.html')
-        if os.path.exists(out_html):
-            os.remove(out_html)
+        print('[kick] lock acquired')
+        # przygotuj ścieżki
+        progress_path = get_data_path('kick', 'progress.json')
+        # inicjalny progres: start scraping
         try:
+            _safe_write_json(progress_path, {
+                'status': 'scraping',
+                'total': 0,
+                'processed': 0,
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+            })
+            print('[kick] progress initialized: scraping')
+        except Exception:
+            print('[kick] progress init failed')
+            pass
+        # Nie usuwaj starego raportu Kick – nowy zostanie zapisany atomowo.
+        # To zapobiega znikaniu raportu w trakcie generowania.
+        try:
+            print('[kick] running scrape_kick_clips.py')
             run_script(os.path.join('kick', 'scrape_kick_clips.py'))
+            print('[kick] scrape completed')
+            # po scrape: zaktualizuj total i status
+            try:
+                cache_path = get_data_path('kick', 'kick_clips_cache.json')
+                total = 0
+                if os.path.exists(cache_path):
+                    with open(cache_path, encoding='utf-8-sig') as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            total = len(data)
+                _safe_write_json(progress_path, {
+                    'status': 'generating',
+                    'total': total,
+                    'processed': 0,
+                    'updated_at': datetime.now(timezone.utc).isoformat(),
+                })
+                print(f"[kick] scrape total clips: {total}")
+            except Exception:
+                pass
+            print('[kick] running generate_raport_kick.py')
             run_script(os.path.join('kick', 'generate_raport_kick.py'))
+            print('[kick] generate completed')
+            # po generowaniu: ustaw finished
+            try:
+                # processed = total jeśli znamy total
+                prog = _safe_read_json(progress_path, {
+                    'status': 'generating', 'total': 0, 'processed': 0
+                })
+                total = int(prog.get('total') or 0)
+                _safe_write_json(progress_path, {
+                    'status': 'finished',
+                    'total': total,
+                    'processed': total,
+                    'updated_at': datetime.now(timezone.utc).isoformat(),
+                })
+                print('[kick] progress set to finished')
+            except Exception:
+                pass
         except CalledProcessError as e:
-            print('[scheduler] kick scrape/report failed:', e.stderr or str(e))
+            print('[kick] job failed:', e.stderr or str(e))
+            try:
+                _safe_write_json(progress_path, {
+                    'status': 'error',
+                    'total': 0,
+                    'processed': 0,
+                    'updated_at': datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
 
 
 # --- safe atomic write/read helpers for JSON ---
@@ -130,15 +254,143 @@ def _safe_write_json(path: str, obj):
     os.replace(tmp, path)
 
 def _safe_read_json(path: str, default=None):
-    try:
-        with open(path, encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return default
+    # Najpierw spróbuj odczytać plik docelowy, jeśli nie wyjdzie — spróbuj plik tymczasowy
+    # To zabezpiecza przed rzadkimi przypadkami, gdy replace jest w trakcie i plik końcowy
+    # jest chwilowo niekompletny (np. widoczny jako "{").
+    for candidate in (path, path + '.tmp'):
+        try:
+            with open(candidate, encoding='utf-8-sig') as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return default
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    # cache_buster wymusza odświeżenie zasobów statycznych po zmianach CSS/JS
+    resp = make_response(render_template('index.html', cache_buster=int(time.time())))
+    try:
+        resp.headers['Cache-Control'] = 'no-store'
+        resp.headers['Pragma'] = 'no-cache'
+        resp.headers['Expires'] = '0'
+        resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+    except Exception:
+        pass
+    return resp
+
+# --- Admin Panel ---
+@app.route('/admin')
+def admin_panel():
+    # Prosty panel administracyjny do edycji preferencji streamerów
+    resp = make_response(render_template('admin.html', cache_buster=int(time.time())))
+    try:
+        resp.headers['Cache-Control'] = 'no-store'
+        resp.headers['Pragma'] = 'no-cache'
+        resp.headers['Expires'] = '0'
+        resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+    except Exception:
+        pass
+    return resp
+
+@app.route('/api/streamers-prefs', methods=['GET', 'POST'])
+def api_streamers_prefs():
+    prefs_default = { 'highlighted': [], 'skipped': [], 'tags': {}, 'platforms': {}, 'tag_groups': {} }
+    prefs_path = get_data_path('streamers_prefs.json')
+    if request.method == 'GET':
+        prefs = _safe_read_json(prefs_path, prefs_default) or prefs_default
+        # Upewnij się, że brakujące pola są obecne (zgodne wstecz)
+        for k,v in prefs_default.items():
+            if k not in prefs:
+                prefs[k] = v
+        return _no_cache(jsonify(prefs))
+    # POST: zapisz preferencje
+    payload = request.get_json(silent=True) or {}
+    highlighted = payload.get('highlighted') or []
+    skipped = payload.get('skipped') or []
+    tags = payload.get('tags') or {}
+    platforms = payload.get('platforms') or {}
+    tag_groups = payload.get('tag_groups') or {}
+    # prosta walidacja typów
+    if not isinstance(highlighted, list) or not isinstance(skipped, list) or not isinstance(tags, dict) or not isinstance(platforms, dict) or not isinstance(tag_groups, dict):
+        return jsonify({'error': 'Nieprawidłowe typy pól'}), 400
+    # Walidacja i normalizacja tag_groups: dict[str] -> list[str]
+    norm_tag_groups = {}
+    try:
+        for raw_name, raw_tags in (tag_groups or {}).items():
+            name = str(raw_name).strip().lower()
+            if not name:
+                continue
+            if not isinstance(raw_tags, list):
+                continue
+            clean_tags = []
+            for t in raw_tags:
+                s = str(t).strip()
+                if not s:
+                    continue
+                # Upewnij się, że każdy tag zaczyna się od '#'
+                if not s.startswith('#'):
+                    s = '#' + s
+                clean_tags.append(s)
+            # deduplikacja przy zachowaniu kolejności
+            seen = set()
+            dedup = []
+            for t in clean_tags:
+                lt = t.lower()
+                if lt in seen:
+                    continue
+                seen.add(lt)
+                dedup.append(t)
+            norm_tag_groups[name] = dedup
+    except Exception:
+        # w razie problemów pozostaw pustą strukturę
+        norm_tag_groups = {}
+    new_prefs = {
+        'highlighted': list(dict.fromkeys([str(x).strip() for x in highlighted if str(x).strip()])),
+        'skipped': list(dict.fromkeys([str(x).strip() for x in skipped if str(x).strip()])),
+        'tags': tags,
+        'platforms': platforms,
+        'tag_groups': norm_tag_groups,
+    }
+    _safe_write_json(prefs_path, new_prefs)
+    return _no_cache(jsonify({'ok': True}))
+
+@app.route('/api/suggest-streamers')
+def api_suggest_streamers():
+    q = (request.args.get('q') or '').strip().lower()
+    platform = (request.args.get('platform') or 'all').strip().lower()
+    suggestions = []
+    # Twitch
+    try:
+        db_twitch = _safe_read_json(get_data_path('database.json'), {'database': []}) or {'database': []}
+        for s in db_twitch.get('database') or []:
+            name = s.get('display_name') or ''
+            if not name:
+                continue
+            if platform in ('all', 'twitch') and (not q or q in name.lower()):
+                suggestions.append({'name': name, 'platform': 'twitch'})
+    except Exception:
+        pass
+    # Kick
+    try:
+        db_kick = _safe_read_json(get_data_path('kick', 'kick_database.json'), {'database': []}) or {'database': []}
+        for s in db_kick.get('database') or []:
+            name = s.get('display_name') or s.get('slug') or ''
+            if not name:
+                continue
+            if platform in ('all', 'kick') and (not q or q in name.lower()):
+                suggestions.append({'name': name, 'platform': 'kick'})
+    except Exception:
+        pass
+    # deduplikacja według (name, platform)
+    seen = set()
+    unique = []
+    for item in suggestions:
+        key = (item['name'], item['platform'])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return _no_cache(jsonify({'suggestions': unique}))
 
 @app.route('/api/update-streamers')
 def api_update_streamers():
@@ -151,28 +403,184 @@ def api_update_streamers():
 
 @app.route('/api/generate-raport')
 def api_generate_raport():
+    # Jeśli raport już się generuje (lock istnieje), nie spawnuj nowego wątku
+    lock_path = get_data_path('reports', 'twitch', 'generate_raport.lock')
+    try:
+        if os.path.exists(lock_path):
+            return _no_cache(jsonify({'message': 'Raport już w toku', 'already_running': True})), 409
+    except Exception:
+        pass
     # uruchamiamy generowanie w tle, kasowanie starego raportu jest w jobie pod lockiem
     threading.Thread(target=job_generate_twitch_report, daemon=True).start()
-    return jsonify({'message': 'Generowanie raportu uruchomione'}), 202
+    return _no_cache(jsonify({'message': 'Generowanie raportu uruchomione', 'already_running': False})), 202
 
 @app.route('/raport')
 def raport():
-    path = get_data_path('raport.html')
-    return send_file(path)
+    new_path = get_data_path('reports', 'twitch', 'raport.html')
+    return send_file(new_path)
 
 @app.route('/api/report-ready')
 def api_report_ready():
-    ready = os.path.exists(get_data_path('raport.html'))
-    return jsonify({'ready': ready})
+    new_path = get_data_path('reports', 'twitch', 'raport.html')
+    ready = os.path.exists(new_path)
+    return _no_cache(jsonify({'ready': ready}))
+
+@app.route('/api/report-status')
+def api_report_status():
+    progress_default = {
+        'status': 'idle',
+        'total': 0,
+        'processed': 0,
+        'last_completed': None,
+        'updated_at': None,
+    }
+    new_progress_path = get_data_path('reports', 'twitch', 'progress.json')
+    progress = _safe_read_json(new_progress_path, progress_default)
+    events_path = get_data_path('reports', 'twitch', 'events.log')
+    recent_events = []
+    active_streamers = []
+    try:
+        with open(events_path, encoding='utf-8') as f:
+            lines = f.readlines()
+        last_lines = lines[-200:]
+        for line in last_lines:
+            try:
+                ev = json.loads(line.strip())
+                if isinstance(ev, dict) and ev.get('event') in ('start', 'done'):
+                    recent_events.append(ev)
+            except Exception:
+                pass
+        counts = {}
+        for ev in recent_events:
+            name = ev.get('name')
+            if not name:
+                continue
+            counts.setdefault(name, 0)
+            if ev.get('event') == 'start':
+                counts[name] += 1
+            elif ev.get('event') == 'done':
+                counts[name] -= 1
+        active_streamers = sorted([n for n, c in counts.items() if c > 0])
+    except Exception:
+        recent_events = []
+        active_streamers = []
+    workers = int(os.getenv('RAPORT_MAX_WORKERS', '5'))
+    return _no_cache(jsonify({
+        'progress': progress,
+        'active_streamers': active_streamers,
+        'recent_events': recent_events[-20:],
+        'workers': workers,
+    }))
+
+# --- ADMIN: force unlock Twitch report + reset progress ---
+@app.route('/api/unlock-twitch', methods=['POST'])
+def api_unlock_twitch():
+    lock_path = get_data_path('reports', 'twitch', 'generate_raport.lock')
+    progress_path = get_data_path('reports', 'twitch', 'progress.json')
+    removed = False
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+            removed = True
+    except Exception:
+        pass
+    # reset progress to idle (helps UI leave stuck state)
+    try:
+        _safe_write_json(progress_path, {
+            'status': 'idle',
+            'total': 0,
+            'processed': 0,
+            'last_completed': None,
+            'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+    return _no_cache(jsonify({'ok': True, 'lock_removed': removed}))
+
+# --- NEW: scheduler info (next run times) ---
+@app.route('/api/schedule-info')
+def api_schedule_info():
+    # Użyj timezone-aware czasu w UTC, aby poprawnie policzyć różnice
+    now = datetime.datetime.now(datetime.timezone.utc)
+    info = {
+        'server_time': now.isoformat() + 'Z',
+        'generate_report': None,
+        'update_streamers': None,
+        'kick_refresh': None,
+    }
+    try:
+        sched = scheduler_instance
+        if sched:
+            jr = sched.get_job('generate_report')
+            if jr and getattr(jr, 'next_run_time', None):
+                nrt = jr.next_run_time
+                try:
+                    # różnica czasu (aware) w sekundach
+                    seconds = int((nrt - now).total_seconds())
+                except Exception:
+                    seconds = None
+                info['generate_report'] = {
+                    'next_run_time': nrt.isoformat(),
+                    'seconds_to_next': max(0, seconds) if isinstance(seconds, int) else None,
+                }
+            ju = sched.get_job('update_streamers')
+            if ju and getattr(ju, 'next_run_time', None):
+                nrt = ju.next_run_time
+                try:
+                    seconds = int((nrt - now).total_seconds())
+                except Exception:
+                    seconds = None
+                info['update_streamers'] = {
+                    'next_run_time': nrt.isoformat(),
+                    'seconds_to_next': max(0, seconds) if isinstance(seconds, int) else None,
+                }
+            jk = sched.get_job('kick_refresh')
+            if jk and getattr(jk, 'next_run_time', None):
+                nrt = jk.next_run_time
+                try:
+                    seconds = int((nrt - now).total_seconds())
+                except Exception:
+                    seconds = None
+                info['kick_refresh'] = {
+                    'next_run_time': nrt.isoformat(),
+                    'seconds_to_next': max(0, seconds) if isinstance(seconds, int) else None,
+                }
+    except Exception as e:
+        info['error'] = str(e)
+    return jsonify(info)
 
 @app.route('/raport-fragment')
 def raport_fragment():
-    # wczytujemy JSON z bazy gotowych danych:
-    with open(get_data_path('raport_data.json'), encoding='utf-8') as f:
-        data = json.load(f)
-    clips = data['clips']
-    stats = data['stats']
-    return render_template('raport_fragment.html', clips=clips, stats=stats)
+    # wczytujemy JSON z bazy gotowych danych (bezpiecznie, tolerując BOM i częściowe zapisy)
+    new_data_path = get_data_path('reports', 'twitch', 'raport_data.json')
+    default_data = {'clips': [], 'stats': {'total_clips': 0, 'top_categories': [], 'top_streamers': []}}
+    data = _safe_read_json(new_data_path, default_data) or default_data
+    # defensywnie upewnij się, że klucze istnieją
+    clips = data.get('clips') or []
+    stats = data.get('stats') or {'total_clips': 0, 'top_categories': [], 'top_streamers': []}
+    # wczytaj preferencje streamerów (wyróżnieni / pomijani / tagi)
+    prefs_default = { 'highlighted': [], 'skipped': [], 'tags': {}, 'platforms': {} }
+    prefs = _safe_read_json(get_data_path('streamers_prefs.json'), prefs_default) or prefs_default
+    # Ujednolicenie wielkości liter dla dopasowania nazw
+    highlighted_streamers = set([str(s).lower() for s in (prefs.get('highlighted') or [])])
+    skipped_streamers = set([str(s).lower() for s in (prefs.get('skipped') or [])])
+    # filtruj klipy dla pomijanych streamerów (proste dopasowanie po display_name)
+    if skipped_streamers:
+        clips = [c for c in clips if (c.get('broadcaster') or '').lower() not in skipped_streamers]
+        # przeliczenie statystyk po filtrze (opcjonalnie)
+        try:
+            from collections import Counter
+            total_clips = len(clips)
+            cat_counts = Counter(c.get('category') for c in clips)
+            broad_counts = Counter(c.get('broadcaster') for c in clips)
+            stats = {
+                'total_clips': total_clips,
+                'top_categories': cat_counts.most_common(3),
+                'top_streamers': broad_counts.most_common(3),
+            }
+        except Exception:
+            pass
+    return _no_cache(render_template('raport_fragment.html', clips=clips, stats=stats, highlighted_streamers=highlighted_streamers))
 
 # --- NEW: selection API and editor page ---
 @app.route('/api/selection', methods=['POST'])
@@ -189,6 +597,117 @@ def api_selection():
             clean.append({k: c.get(k) for k in allowed_keys})
     _safe_write_json(get_data_path('selection.json'), {'clips': clean})
     return jsonify({'ok': True, 'count': len(clean)})
+
+# --- Add clip by direct URL (Twitch/Kick) ---
+def _parse_twitch_clip_id(url: str):
+    try:
+        p = urlsplit(url)
+        path = p.path or ''
+        segs = [s for s in path.split('/') if s]
+        if 'clips.twitch.tv' in (p.netloc or ''):
+            return segs[-1] if segs else None
+        for i, s in enumerate(segs):
+            if s.lower() == 'clip' and i+1 < len(segs):
+                return segs[i+1]
+    except Exception:
+        pass
+    return None
+
+def _resolve_twitch_metadata(url: str):
+    clip_id = _parse_twitch_clip_id(url)
+    if not clip_id:
+        return {}
+    client_id = os.getenv('TWITCH_CLIENT_ID')
+    client_secret = os.getenv('TWITCH_CLIENT_SECRET')
+    if not client_id or not client_secret:
+        return {'title': None, 'broadcaster': None, 'clip_id': clip_id}
+    try:
+        tok = requests.post(
+            'https://id.twitch.tv/oauth2/token',
+            data={'client_id': client_id, 'client_secret': client_secret, 'grant_type': 'client_credentials'},
+            timeout=20
+        ).json()
+        access_token = tok.get('access_token')
+        if not access_token:
+            return {'title': None, 'broadcaster': None, 'clip_id': clip_id}
+        res = requests.get(
+            'https://api.twitch.tv/helix/clips',
+            headers={'Client-ID': client_id, 'Authorization': f'Bearer {access_token}'},
+            params={'id': clip_id},
+            timeout=20
+        )
+        data = {}
+        try:
+            data = res.json() or {}
+        except Exception:
+            data = {}
+        items = data.get('data') or []
+        if items:
+            it = items[0]
+            return {'title': it.get('title'), 'broadcaster': it.get('broadcaster_name') or it.get('creator_name'), 'clip_id': clip_id}
+    except Exception:
+        pass
+    return {'title': None, 'broadcaster': None, 'clip_id': clip_id}
+
+def _resolve_kick_metadata(url: str):
+    try:
+        p = urlsplit(url)
+        segs = [s for s in (p.path or '').split('/') if s]
+        if len(segs) >= 3 and segs[-2].lower() == 'clips':
+            slug = segs[-3]
+            cid = segs[-1]
+        else:
+            slug = segs[0] if segs else None
+            cid = segs[-1] if segs else None
+        broadcaster = slug or None
+        title = None
+        try:
+            from kickapi import KickAPI
+            api = KickAPI()
+            ch = api.channel(slug)
+            for c in getattr(ch, 'clips', []) or []:
+                if str(getattr(c, 'id', '')) == str(cid):
+                    title = getattr(c, 'title', None)
+                    try:
+                        bj = getattr(ch, 'json', {}) or {}
+                        broadcaster = bj.get('display_name') or broadcaster
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            pass
+        return {'title': title, 'broadcaster': broadcaster, 'clip_id': cid}
+    except Exception:
+        return {'title': None, 'broadcaster': None, 'clip_id': None}
+
+def _resolve_clip_metadata(url: str):
+    try:
+        p = urlsplit(url)
+        host = (p.netloc or '').lower()
+    except Exception:
+        host = ''
+    if 'twitch.tv' in host:
+        return _resolve_twitch_metadata(url)
+    if 'kick.com' in host or 'stream.kick.com' in host:
+        return _resolve_kick_metadata(url)
+    return {'title': None, 'broadcaster': None}
+
+@app.route('/api/add-clip-by-url', methods=['POST'])
+def api_add_clip_by_url():
+    data = request.get_json(silent=True) or {}
+    url = (data.get('url') or '').strip()
+    if not url:
+        return jsonify({'ok': False, 'error': 'Brak URL klipu'}), 400
+    meta = _resolve_clip_metadata(url)
+    title = meta.get('title') or '(bez tytułu)'
+    broadcaster = meta.get('broadcaster') or ''
+    sel = _safe_read_json(get_data_path('selection.json'), default={'clips': []})
+    clips = sel.get('clips', [])
+    clips = [c for c in clips if c.get('url') != url]
+    clip_obj = {'url': url, 'title': title, 'broadcaster': broadcaster}
+    clips.append(clip_obj)
+    _safe_write_json(get_data_path('selection.json'), {'clips': clips})
+    return jsonify({'ok': True, 'clip': clip_obj, 'count': len(clips)})
 
 @app.route('/editor')
 def editor():
@@ -589,6 +1108,22 @@ def _write_status(clip_id: str, state: str, **extra):
 def _read_status(clip_id: str):
     return _safe_read_json(_status_path_for(clip_id), default=None)
 
+# --- RENDER STATUS HELPERS ---------------------------------
+def _render_status_path_for(clip_id: str) -> str:
+    return get_data_path('render', f'{clip_id}.json')
+
+def _write_render_status(clip_id: str, state: str, **extra):
+    try:
+        os.makedirs(get_data_path('render'), exist_ok=True)
+    except Exception:
+        pass
+    payload = {'clip_id': clip_id, 'state': state}
+    payload.update(extra or {})
+    _safe_write_json(_render_status_path_for(clip_id), payload)
+
+def _read_render_status(clip_id: str):
+    return _safe_read_json(_render_status_path_for(clip_id), default=None)
+
 
 def _transcribe_worker(clip_id: str, language: str, model: str, diarize: bool):
     try:
@@ -764,19 +1299,48 @@ def api_render():
     clip_id = (data.get('clip_id') or '').strip()
     game = data.get('game') or {}
     camera = data.get('camera') or {}
-    karaoke_debug = bool(data.get('karaoke_debug', False))
+    # Bezpieczne parsowanie booleanów z różnych typów (bool/int/str)
+    def _parse_bool(val, default=False):
+        try:
+            if val is None:
+                return default
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, (int, float)):
+                return (val != 0)
+            s = str(val).strip().lower()
+            if s in ('1', 'true', 'yes', 'y', 'on', 'enable', 'enabled'): return True
+            if s in ('0', 'false', 'no', 'n', 'off', 'disable', 'disabled'): return False
+        except Exception:
+            pass
+        return default
+
+    karaoke_debug = _parse_bool(data.get('karaoke_debug', False), False)
+    # NEW: allow disabling subtitles (karaoke/SRT) from the client
+    include_subtitles = _parse_bool(data.get('include_subtitles', True), True)
     karaoke_debug_info = {}
     try:
         g_ratio = float(data.get('game_ratio', 0.7))
     except Exception:
         g_ratio = 0.7
     g_ratio = max(0.0, min(1.0, g_ratio))
-    auto_split = bool(data.get('auto_split', False))
+    auto_split = _parse_bool(data.get('auto_split', False), False)
 
     # Nowy parametr: sposób dopasowania do paneli (contain vs cover)
     fit_mode = str(data.get('fit_mode', 'contain')).lower()
     if fit_mode not in ('contain', 'cover'):
         fit_mode = 'contain'
+
+    # Tryb jednego kadru
+    single_frame = _parse_bool(data.get('single_frame', False), False)
+    try:
+        single_height_ratio = float(data.get('single_height_ratio', 0.4))
+    except Exception:
+        single_height_ratio = 0.4
+    single_height_ratio = max(0.05, min(0.95, single_height_ratio))
+    panel_h = max(2, int(round(1920 * single_height_ratio)))
+    if panel_h % 2:
+        panel_h += 1
 
     if not clip_id:
         return jsonify({'ok': False, 'error': 'clip_id required'}), 400
@@ -815,11 +1379,18 @@ def api_render():
         p_cam = 1.0 / a_cam
         p_game = 1.0 / a_game
         s = p_cam + p_game
-        top_h = max(1, int(round(out_h * (p_cam / s))))  # camera
-        bot_h = max(1, out_h - top_h)  # game
+        top_h = max(2, int(round(out_h * (p_cam / s))))  # camera
+        bot_h = max(2, out_h - top_h)  # game
     else:
-        top_h = max(1, int(round(out_h * (1.0 - g_ratio))))  # camera
-        bot_h = max(1, out_h - top_h)  # game
+        top_h = max(2, int(round(out_h * (1.0 - g_ratio))))  # camera
+        bot_h = max(2, out_h - top_h)  # game
+    # wymuś parzystość, aby uniknąć artefaktów skalowania/cropu
+    if top_h % 2: top_h += 1
+    if bot_h % 2: bot_h -= 1
+    if bot_h <= 0: bot_h = 2
+    if top_h + bot_h != out_h:
+        # dopasuj przez korektę do sumy out_h
+        bot_h = out_h - top_h
 
     # locate ffmpeg
     ffmpeg = shutil.which('ffmpeg') or shutil.which('ffmpeg.exe')
@@ -830,13 +1401,45 @@ def api_render():
         except Exception:
             return jsonify({'ok': False, 'error': 'ffmpeg not found in PATH (or imageio-ffmpeg not installed)'}), 500
 
-    # build filter: crop normalized -> scale (cover) -> center crop -> vstack
+    # Zapisz status rozpoczęcia renderu z podstawowymi parametrami
+    try:
+        _write_render_status(
+            clip_id,
+            'running',
+            params={
+                'game': game,
+                'camera': camera,
+                'game_ratio': g_ratio,
+                'auto_split': auto_split,
+                'single_frame': single_frame,
+                'single_height_ratio': single_height_ratio,
+                'fit_mode': fit_mode,
+                'start': ss,
+                'end': to,
+            }
+        )
+    except Exception:
+        pass
+
+    # build filter: crop normalized -> scale (cover) -> center crop -> vstack lub single-frame overlay
     # use limited precision to keep command readable
     fmt = lambda v: f'{v:.6f}'.rstrip('0').rstrip('.') if isinstance(v, float) else str(v)
-    crop_game = f"crop=iw*{fmt(gw)}:ih*{fmt(gh)}:iw*{fmt(gx)}:ih*{fmt(gy)}"
-    crop_cam  = f"crop=iw*{fmt(cw)}:ih*{fmt(ch)}:iw*{fmt(cx)}:ih*{fmt(cy)}"
+    crop_game = f"crop=floor(iw*{fmt(gw)}):floor(ih*{fmt(gh)}):floor(iw*{fmt(gx)}):floor(ih*{fmt(gy)})"
+    crop_cam  = f"crop=floor(iw*{fmt(cw)}):floor(ih*{fmt(ch)}):floor(iw*{fmt(cx)}):floor(ih*{fmt(cy)})"
 
-    if fit_mode == 'contain':
+    if single_frame:
+        # Tło: ten sam klip (gameRect) pokrywa cały kadr, następnie mocne rozmycie i lekkie przyciemnienie
+        scale_bg    = f"scale=w='if(gt(a,{out_w}/{out_h}),-2,{out_w})':h='if(gt(a,{out_w}/{out_h}),{out_h},-2)'"
+        center_bg   = f"crop={out_w}:{out_h}:floor((iw-{out_w})/2):floor((ih-{out_h})/2)"
+        # Panel: pełna szerokość, wysokość = panel_h, cover + center crop
+        scale_panel = f"scale=w='if(gt(a,{out_w}/{panel_h}),-2,{out_w})':h='if(gt(a,{out_w}/{panel_h}),{panel_h},-2)'"
+        center_panel= f"crop={out_w}:{panel_h}:floor((iw-{out_w})/2):floor((ih-{panel_h})/2)"
+        filter_complex = (
+            f"[0:v]{crop_game},{scale_bg},{center_bg},gblur=sigma=16,eq=brightness=-0.08[bg];"
+            f"[0:v]{crop_game},{scale_panel},{center_panel}[panel];"
+            f"[bg][panel]overlay=x=0:y=(H-h)/2[outv]"
+        )
+    elif fit_mode == 'contain':
         # Dopasowanie bez crop: skaluj w granicach panelu, zachowując proporcje i parzyste wymiary, potem wyrównaj padami
         scale_cam  = f"scale={out_w}:{top_h}:force_original_aspect_ratio=decrease:force_divisible_by=2"
         scale_game = f"scale={out_w}:{bot_h}:force_original_aspect_ratio=decrease:force_divisible_by=2"
@@ -848,14 +1451,14 @@ def api_render():
             f"[cam][game]vstack=inputs=2[outv]"
         )
     else:
-        # Pokrycie panelu (cover): domyślnie delikatnie zmniejszamy zoom (~4%) i dopadujemy do rozmiaru docelowego
+        # Pokrycie panelu (cover strict): skaluj tak, aby panel był w pełni wypełniony, następnie przytnij do docelowych wymiarów; bez padów i bez soften
         scale_cam  = f"scale=w='if(gt(a,{out_w}/{top_h}),-2,{out_w})':h='if(gt(a,{out_w}/{top_h}),{top_h},-2)'"
         scale_game = f"scale=w='if(gt(a,{out_w}/{bot_h}),-2,{out_w})':h='if(gt(a,{out_w}/{bot_h}),{bot_h},-2)'"
-        soften_cam  = f"scale=w='trunc(iw*0.96)':h='trunc(ih*0.96)',pad={out_w}:{top_h}:(ow-iw)/2:(oh-ih)/2"
-        soften_game = f"scale=w='trunc(iw*0.96)':h='trunc(ih*0.96)',pad={out_w}:{bot_h}:(ow-iw)/2:(oh-ih)/2"
+        center_cam   = f"crop={out_w}:{top_h}:floor((iw-{out_w})/2):floor((ih-{top_h})/2)"
+        center_game  = f"crop={out_w}:{bot_h}:floor((iw-{out_w})/2):floor((ih-{bot_h})/2)"
         filter_complex = (
-            f"[0:v]{crop_cam},{scale_cam},{soften_cam}[cam];"
-            f"[0:v]{crop_game},{scale_game},{soften_game}[game];"
+            f"[0:v]{crop_cam},{scale_cam},{center_cam}[cam];"
+            f"[0:v]{crop_game},{scale_game},{center_game}[game];"
             f"[cam][game]vstack=inputs=2[outv]"
         )
 
@@ -907,12 +1510,60 @@ def api_render():
         out_path
     ]
 
+    # Szczegółowe logowanie komendy ffmpeg
+    try:
+        print(f"[RENDER] ffmpeg exe: {ffmpeg}")
+        print(f"[RENDER] cmd: {' '.join(cmd)}")
+    except Exception:
+        pass
+
     try:
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
-            return jsonify({'ok': False, 'error': res.stderr or res.stdout or 'ffmpeg failed', 'cmd': ' '.join(cmd)}), 500
+            err_text = (res.stderr or '')[-2000:] or (res.stdout or '')[-2000:]
+            # Usuń nieudany plik wyjściowy, aby można było ponowić
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
+            try:
+                _write_render_status(
+                    clip_id,
+                    'error',
+                    error=err_text,
+                    cmd=' '.join(cmd),
+                    ffmpeg=ffmpeg,
+                    ffmpeg_stderr=(res.stderr or '')[-2000:],
+                    ffmpeg_stdout=(res.stdout or '')[-2000:]
+                )
+            except Exception:
+                pass
+            return jsonify({
+                'ok': False,
+                'error': err_text,
+                'stderr': (res.stderr or '')[-2000:],
+                'stdout': (res.stdout or '')[-2000:],
+                'cmd': ' '.join(cmd),
+                'ffmpeg': ffmpeg,
+            }), 500
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+        try:
+            _write_render_status(
+                clip_id,
+                'error',
+                error=str(e),
+                cmd=' '.join(cmd),
+                ffmpeg=ffmpeg
+            )
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': str(e), 'cmd': ' '.join(cmd), 'ffmpeg': ffmpeg}), 500
 
     # --- Karaoke overlay (MoviePy) automatycznie, jeśli mamy word-level JSON ---
     karaoke_status = 'skipped'
@@ -1195,10 +1846,13 @@ def api_render():
             except Exception:
                 pass
 
-    _apply_karaoke_if_available()
+    if include_subtitles:
+        _apply_karaoke_if_available()
+    else:
+        karaoke_status = 'disabled'
 
     # --- Jeżeli karaoke nie zostało zastosowane, spróbuj wypalić SRT jako fallback ---
-    if (not ffmpeg_srt_burned) and (karaoke_status != 'applied') and os.path.exists(srt_path):
+    if include_subtitles and (not ffmpeg_srt_burned) and (karaoke_status != 'applied') and os.path.exists(srt_path):
         try:
             # Jeśli zastosowano przycięcie (-ss), przesuń czasy w SRT o -ss, aby dopasować do wyrenderowanego klipu
             srt_use_path = srt_path
@@ -1251,7 +1905,45 @@ def api_render():
             res2 = subprocess.run(cmd2, capture_output=True, text=True)
             if res2.returncode == 0:
                 try:
-                    os.replace(tmp_out2, out_path)
+                    # Spróbuj podmienić wynik na główny plik. Na Windows zdarza się lock (WinError 5).
+                    # Dodaj niewielkie ponawianie.
+                    replaced = False
+                    for _ in range(5):
+                        try:
+                            os.replace(tmp_out2, out_path)
+                            replaced = True
+                            break
+                        except Exception:
+                            try:
+                                import time as _t
+                                _t.sleep(0.3)
+                            except Exception:
+                                pass
+                    if not replaced:
+                        # Użyj alternatywnej nazwy, aby nie tracić wyniku napisów
+                        alt_name = f"{clip_id}_1080x1920.subs.mp4"
+                        alt_path = get_data_path('media', 'exports', alt_name)
+                        try:
+                            os.replace(tmp_out2, alt_path)
+                            # zaktualizuj docelowy URL, aby wskazywał na plik z napisami
+                            prev_status = karaoke_status
+                            karaoke_status = f"fallback_srt_applied_alt (prev: {prev_status})"
+                            url = f"/media/exports/{alt_name}"
+                            # posprzątaj tymczasowy SRT
+                            try:
+                                if srt_use_path and srt_use_path != srt_path and os.path.exists(srt_use_path):
+                                    os.remove(srt_use_path)
+                            except Exception:
+                                pass
+                            # Zapisz status i wróć
+                            try:
+                                _write_render_status(clip_id, 'done', url=url, karaoke=karaoke_status)
+                            except Exception:
+                                pass
+                            return jsonify({'ok': True, 'url': url, 'karaoke': karaoke_status, 'karaoke_debug': (karaoke_debug_info if karaoke_debug else None)})
+                        except Exception as e2:
+                            # ostatnia deska: nie udało się także alternatywne os.replace
+                            raise e2
                     prev_status = karaoke_status
                     karaoke_status = f"fallback_srt_applied (prev: {prev_status})"
                     # posprzątaj tymczasowy SRT
@@ -1279,7 +1971,76 @@ def api_render():
             karaoke_status = f'fallback_srt_exception: {e}'
 
     url = f"/media/exports/{out_name}"
+    try:
+        _write_render_status(
+            clip_id,
+            'done',
+            url=url,
+            karaoke=karaoke_status,
+            karaoke_debug=(karaoke_debug_info if karaoke_debug else None),
+            ffmpeg_cmd=' '.join(cmd),
+            params={
+                'game': game,
+                'camera': camera,
+                'game_ratio': g_ratio,
+                'auto_split': auto_split,
+                'single_frame': single_frame,
+                'single_height_ratio': single_height_ratio,
+                'fit_mode': fit_mode,
+                'start': ss,
+                'end': to,
+                'include_subtitles': include_subtitles
+            }
+        )
+    except Exception:
+        pass
     return jsonify({'ok': True, 'url': url, 'karaoke': karaoke_status, 'karaoke_debug': (karaoke_debug_info if karaoke_debug else None)})
+
+@app.route('/api/render/status')
+def api_render_status():
+    clip_id = (request.args.get('clip_id') or '').strip()
+    if not clip_id:
+        return jsonify({'error': 'clip_id required'}), 400
+    out_name = f"{clip_id}_1080x1920.mp4"
+    out_path = get_data_path('media', 'exports', out_name)
+    url = f"/media/exports/{out_name}"
+    st = _read_render_status(clip_id)
+    # Tryb verbose pozwala zwrócić dodatkowe pola diagnostyczne
+    def _parse_bool(val, default=False):
+        try:
+            if val is None:
+                return default
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, (int, float)):
+                return (val != 0)
+            s = str(val).strip().lower()
+            if s in ('1', 'true', 'yes', 'y', 'on', 'enable', 'enabled'): return True
+            if s in ('0', 'false', 'no', 'n', 'off', 'disable', 'disabled'): return False
+        except Exception:
+            pass
+        return default
+    verbose = _parse_bool(request.args.get('verbose'), False)
+    if os.path.exists(out_path):
+        resp = {'clip_id': clip_id, 'state': 'done', 'url': url}
+        try:
+            if isinstance(st, dict) and 'karaoke' in st:
+                resp['karaoke'] = st.get('karaoke')
+            if verbose and isinstance(st, dict):
+                # Dołącz ograniczoną diagnostykę z pliku statusu
+                for key in ('params','ffmpeg_cmd','ffmpeg','ffmpeg_stderr','ffmpeg_stdout','error','karaoke_debug'):
+                    if key in st:
+                        resp[key] = st.get(key)
+        except Exception:
+            pass
+        return jsonify(resp)
+    if st:
+        if verbose and isinstance(st, dict):
+            return jsonify(st)
+        # Bez verbose: zwróć tylko podstawowe pola
+        base = {k: st.get(k) for k in ('clip_id','state','error','url','karaoke') if isinstance(st, dict)} if isinstance(st, dict) else st
+        return jsonify(base)
+    return jsonify({'clip_id': clip_id, 'state': 'idle'})
 
 @app.route('/api/crop/<clip_id>')
 def api_get_crop(clip_id: str):
@@ -1448,7 +2209,7 @@ def api_publish_publer(clip_id: str):
     app.logger.info(f"DEBUG: File exists: {os.path.exists(local_path)}")
 
     if not os.path.exists(local_path):
-        return jsonify({'ok': False, 'error': f'export not found: {filename}', 'hint': 'Run /api/render first'}), 404
+        return jsonify({'ok': False, 'error': f'export not found: {filename}', 'hint': 'Run /api/render first', 'source': 'app'}), 404
 
     dry_run = False
     if not api_key or not workspace_id or not account_ids:
@@ -1496,7 +2257,7 @@ def api_publish_publer(clip_id: str):
             up_json = {'text': up.text}
         if not up.ok:
             _write_publish_log_publer(clip_id, {'upload_form': form}, up_json, 'upload_error')
-            return jsonify({'ok': False, 'error': 'publer upload failed', 'status_code': up.status_code, 'response': up_json}), 502
+            return jsonify({'ok': False, 'error': 'publer upload failed', 'status_code': up.status_code, 'response': up_json, 'source': 'publer'}), 502
         # Robust extraction of media fields from upload response
         media_id = None
         media_path = None
@@ -1525,10 +2286,10 @@ def api_publish_publer(clip_id: str):
         _write_publish_log_publer(clip_id, {'upload_debug': {'up_json': up_json, 'media_id': media_id, 'media_path': media_path, 'upload_thumbnails': upload_thumbnails}}, None, 'upload_debug')
         if not media_id:
             _write_publish_log_publer(clip_id, {'upload_response': up_json}, up_json, 'upload_missing_id')
-            return jsonify({'ok': False, 'error': 'missing media id from Publer upload', 'response': up_json}), 502
+            return jsonify({'ok': False, 'error': 'missing media id from Publer upload', 'response': up_json, 'source': 'publer'}), 502
     except Exception as e:
         _write_publish_log_publer(clip_id, {'exception': str(e)}, None, 'upload_exception')
-        return jsonify({'ok': False, 'error': f'upload exception: {e}'}), 502
+        return jsonify({'ok': False, 'error': f'upload exception: {e}', 'source': 'publer'}), 502
 
     # Po uploadzie: poczekaj na miniatury, aby móc ustawić default_thumbnail
     app.logger.info(f"DEBUG: Starting thumbnails section for {clip_id}")
@@ -1541,7 +2302,7 @@ def api_publish_publer(clip_id: str):
         # Walidacja miniaturek - przerywamy publikację, jeśli nie są dostępne
         if not (isinstance(thumbs, list) and thumbs):
             _write_publish_log_publer(clip_id, {'reason': 'no_thumbnails_yet'}, None, 'abort_no_thumbnails')
-            return jsonify({'ok': False, 'error': 'Publer thumbnails not ready yet; retry later'}), 409
+            return jsonify({'ok': False, 'error': 'Publer thumbnails not ready yet; retry later', 'source': 'publer'}), 409
             
         # Publer używa 1-based index dla default_thumbnail (np. Reels)
         default_thumb_index = 1
@@ -1551,7 +2312,7 @@ def api_publish_publer(clip_id: str):
         print(f"[DEBUG] Miniatury gotowe: {len(thumbs)} miniatur, default_thumb_index={default_thumb_index}")
     except Exception as e:
         _write_publish_log_publer(clip_id, {'thumbnails_exception': str(e)}, None, 'thumbnails_exception')
-        return jsonify({'ok': False, 'error': f'Error fetching thumbnails: {str(e)}'}), 502
+        return jsonify({'ok': False, 'error': f'Error fetching thumbnails: {str(e)}', 'source': 'publer'}), 502
         _write_publish_log_publer(clip_id, {'debug_thumbnails_error': str(e)}, None, 'debug_thumbnails_error')
 
     # Etap 2: publikacja
@@ -1568,7 +2329,7 @@ def api_publish_publer(clip_id: str):
         if not provider:
             # Jeśli nie znamy mapowania dla danego konta, zwróć błąd
             _write_publish_log_publer(clip_id, {'unknown_account_id': aid}, None, 'unknown_account_id')
-            return jsonify({'ok': False, 'error': f'Unknown account_id: {aid}'}), 400
+            return jsonify({'ok': False, 'error': f'Unknown account_id: {aid}', 'source': 'app'}), 400
             
         # Tworzenie media_obj bez 'type' (type jest tylko na poziomie networks)
         media_obj = {'id': media_id}
@@ -1597,7 +2358,7 @@ def api_publish_publer(clip_id: str):
     # Walidacja czy mamy jakiekolwiek networks
     if not networks:
         _write_publish_log_publer(clip_id, {'reason': 'no_networks'}, None, 'no_networks')
-        return jsonify({'ok': False, 'error': 'No valid networks configured for provided account_ids'}), 400
+        return jsonify({'ok': False, 'error': 'No valid networks configured for provided account_ids', 'source': 'app'}), 400
         
     # Logowanie finalnego payloadu dla debugowania
     print(f"[DEBUG] Finalny payload networks: {networks}")
@@ -1632,7 +2393,7 @@ def api_publish_publer(clip_id: str):
             res_json = {'text': res.text}
         if not res.ok:
             _write_publish_log_publer(clip_id, post_payload, res_json, 'publish_error')
-            return jsonify({'ok': False, 'error': 'publer publish failed', 'status_code': res.status_code, 'response': res_json}), 502
+            return jsonify({'ok': False, 'error': 'publer publish failed', 'status_code': res.status_code, 'response': res_json, 'source': 'publer'}), 502
         _write_publish_log_publer(clip_id, post_payload, res_json, 'published')
         # Polling job_status (jeśli dostępny job_id), aby wykryć ewentualne błędy i je zalogować
         job_id = res_json.get('job_id') if isinstance(res_json, dict) else None
@@ -1661,9 +2422,11 @@ def api_publish_publer(clip_id: str):
                     break
                 time.sleep(1)
             _write_publish_log_publer(clip_id, {'post_payload': post_payload, 'job_id': job_id}, job_status, 'job_status')
-            # Evaluate job_status to determine final publish result per account
+            # Evaluate job_status to determine final publish result per account (dokładny feedback)
             published_flag = True
             errors = []
+            per_accounts = []
+            source = 'publer'
             try:
                 if isinstance(job_status, dict):
                     payload = job_status.get('payload')
@@ -1671,32 +2434,52 @@ def api_publish_publer(clip_id: str):
                         for item in payload:
                             item_status = str(item.get('status', '')).lower()
                             item_type = str(item.get('type', '')).lower()
+                            failure = item.get('failure') or {}
+                            acc_id = failure.get('account_id') or item.get('account_id')
+                            acc_name = failure.get('account_name') or item.get('account_name')
+                            provider = failure.get('provider') or item.get('provider')
+                            message = failure.get('message') or item.get('message')
+                            # zbuduj podsumowanie per konto
+                            per_accounts.append({
+                                'provider': provider,
+                                'account_id': acc_id,
+                                'account_name': acc_name,
+                                'status': item_status or (item_type if item_type in ('error','success') else ''),
+                                **({'message': message} if message else {})
+                            })
                             if item_type == 'error' or item_status in ('failed', 'error'):
                                 published_flag = False
-                                failure = item.get('failure') or {}
                                 errors.append({
-                                    'provider': failure.get('provider') or item.get('provider'),
-                                    'account_id': failure.get('account_id') or item.get('account_id'),
-                                    'account_name': failure.get('account_name') or item.get('account_name'),
-                                    'message': failure.get('message') or item.get('message')
+                                    'provider': provider,
+                                    'account_id': acc_id,
+                                    'account_name': acc_name,
+                                    'message': message or 'Unknown Publer error'
                                 })
                     top_status = str(job_status.get('status') or job_status.get('state') or '').lower()
                     if top_status in ('failed', 'error'):
                         published_flag = False
             except Exception as e:
                 errors.append({'message': f'job_status evaluation error: {e}'})
-            return jsonify({
+            # Określ źródło błędu: Publer vs aplikacja (tu: Publer, bo błąd po stronie job_status)
+            err_source = None
+            if not published_flag:
+                err_source = 'publer'
+            summary = {
                 'ok': published_flag,
                 'published': published_flag,
                 'response': res_json,
                 'job_id': job_id,
                 'job_status': job_status,
-                **({'errors': errors} if errors else {})
-            })
+                'per_accounts': per_accounts,
+                **({'errors': errors} if errors else {}),
+                **({'source': err_source} if err_source else {})
+            }
+            _write_publish_log_publer(clip_id, {'summary': summary}, None, 'publish_summary')
+            return jsonify(summary)
         return jsonify({'ok': True, 'published': True, 'response': res_json})
     except Exception as e:
         _write_publish_log_publer(clip_id, post_payload, {'exception': str(e)}, 'publish_exception')
-        return jsonify({'ok': False, 'error': f'publish exception: {e}'}), 502
+        return jsonify({'ok': False, 'error': f'publish exception: {e}', 'source': 'publer'}), 502
 
 @app.route('/api/publer/workspaces', methods=['GET'])
 def api_publer_workspaces():
@@ -1742,35 +2525,188 @@ def api_publer_accounts():
     except Exception as e:
         return jsonify({'ok': False, 'error': f'Exception: {e}'}), 502
 
+# Dodatkowy endpoint: weryfikacja statusu publikacji po job_id (dokładny feedback per konto)
+@app.route('/api/publer/post-status', methods=['GET'])
+def api_publer_post_status():
+    job_id = (request.args.get('job_id') or '').strip()
+    api_key = (request.args.get('api_key') or os.getenv('PUBLER_API_KEY') or '').strip()
+    workspace_id = (request.args.get('workspace_id') or os.getenv('PUBLER_WORKSPACE_ID') or '').strip()
+    if not job_id:
+        return jsonify({'ok': False, 'error': 'Missing job_id'}), 400
+    if not api_key:
+        return jsonify({'ok': False, 'error': 'Missing PUBLER_API_KEY'}), 400
+    if not workspace_id:
+        return jsonify({'ok': False, 'error': 'Missing PUBLER_WORKSPACE_ID'}), 400
+    try:
+        jr = requests.get(
+            f'https://app.publer.com/api/v1/job_status/{job_id}',
+            headers=_publer_headers(api_key, workspace_id),
+            timeout=30
+        )
+        try:
+            job_status = jr.json()
+        except Exception:
+            job_status = {'text': jr.text}
+        published_flag = jr.ok
+        errors = []
+        per_accounts = []
+        try:
+            if isinstance(job_status, dict):
+                payload = job_status.get('payload')
+                if isinstance(payload, list):
+                    for item in payload:
+                        item_status = str(item.get('status', '')).lower()
+                        item_type = str(item.get('type', '')).lower()
+                        failure = item.get('failure') or {}
+                        acc_id = failure.get('account_id') or item.get('account_id')
+                        acc_name = failure.get('account_name') or item.get('account_name')
+                        provider = failure.get('provider') or item.get('provider')
+                        message = failure.get('message') or item.get('message')
+                        per_accounts.append({
+                            'provider': provider,
+                            'account_id': acc_id,
+                            'account_name': acc_name,
+                            'status': item_status or (item_type if item_type in ('error','success') else ''),
+                            **({'message': message} if message else {})
+                        })
+                        if item_type == 'error' or item_status in ('failed', 'error'):
+                            published_flag = False
+                            errors.append({
+                                'provider': provider,
+                                'account_id': acc_id,
+                                'account_name': acc_name,
+                                'message': message or 'Unknown Publer error'
+                            })
+                top_status = str(job_status.get('status') or job_status.get('state') or '').lower()
+                if top_status in ('failed', 'error'):
+                    published_flag = False
+        except Exception as e:
+            errors.append({'message': f'job_status evaluation error: {e}'})
+        err_source = None
+        if not published_flag:
+            err_source = 'publer'
+        summary = {
+            'ok': published_flag,
+            'published': published_flag,
+            'job_id': job_id,
+            'job_status': job_status,
+            'per_accounts': per_accounts,
+            **({'errors': errors} if errors else {}),
+            **({'source': err_source} if err_source else {})
+        }
+        return jsonify(summary), 200 if published_flag else 502
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Exception: {e}'}), 502
+
 # --- KICK REPORT ENDPOINTS --------------------------------
+def _no_cache(resp):
+    try:
+        resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        resp.headers['Pragma'] = 'no-cache'
+        resp.headers['Expires'] = '0'
+    except Exception:
+        pass
+    return resp
 
 @app.route('/api/generate-raport-kick')
 def api_generate_raport_kick():
     # uruchamiamy scrape+raport w tle; kasowanie starego HTML jest w jobie pod lockiem
+    print('[kick] api_generate_raport_kick: spawn background thread')
     threading.Thread(target=job_refresh_kick_and_report, daemon=True).start()
-    return jsonify({'message': 'Scrape + generowanie Kick uruchomione'}), 202
+    return _no_cache(jsonify({'message': 'Scrape + generowanie Kick uruchomione'})), 202
 
 @app.route('/raport-kick')
 def raport_kick():
-    return send_file(get_data_path('kick', 'raport_kick.html'))
+    return _no_cache(send_file(get_data_path('kick', 'raport_kick.html')))
 
 @app.route('/api/report-kick-ready')
 def api_report_kick_ready():
-    ready = os.path.exists(get_data_path('kick', 'raport_kick.html'))
-    return jsonify({'ready': ready})
+    # Raport Kick uznaj za gotowy tylko, gdy istnieje plik HTML i bieżący cykl nie jest w trakcie
+    progress_default = {
+        'status': 'idle',
+        'total': 0,
+        'processed': 0,
+        'updated_at': None,
+    }
+    try:
+        p = _safe_read_json(get_data_path('kick', 'progress.json'), progress_default) or progress_default
+    except Exception:
+        p = progress_default
+    st = str((p or {}).get('status') or '').lower()
+    exists = os.path.exists(get_data_path('kick', 'raport_kick.html'))
+    # Traktuj 'finished' i 'idle' jako gotowe; unikaj zwracania gotowości podczas 'scraping'/'generating'
+    fresh = st in ('finished', 'idle', '')
+    return _no_cache(jsonify({'ready': bool(exists and fresh), 'status': st}))
 
 @app.route('/raport-kick-fragment')
 def raport_kick_fragment():
-    with open(get_data_path('kick', 'raport_kick_data.json'),
-              encoding='utf-8') as f:
-        data = json.load(f)
-    return render_template('raport_kick_fragment.html',
-                           clips=data['clips'], stats=data['stats'])
+    # bezpieczny odczyt danych raportu Kick (eliminuje JSONDecodeError przy BOM/partial)
+    data_path = get_data_path('kick', 'raport_kick_data.json')
+    default_data = {'clips': [], 'stats': {'total_clips': 0}}
+    data = _safe_read_json(data_path, default_data) or default_data
+    clips = data.get('clips') or []
+    stats = data.get('stats') or {'total_clips': 0}
+    # wczytaj preferencje streamerów (wyróżnieni / pomijani / tagi)
+    prefs_default = { 'highlighted': [], 'skipped': [], 'tags': {}, 'platforms': {} }
+    prefs = _safe_read_json(get_data_path('streamers_prefs.json'), prefs_default) or prefs_default
+    # Ujednolicenie wielkości liter dla dopasowania nazw
+    highlighted_streamers = set([str(s).lower() for s in (prefs.get('highlighted') or [])])
+    skipped_streamers = set([str(s).lower() for s in (prefs.get('skipped') or [])])
+    # filtr pomijanych
+    if skipped_streamers:
+        clips = [c for c in clips if (c.get('broadcaster') or '').lower() not in skipped_streamers]
+        try:
+            from collections import Counter
+            total_clips = len(clips)
+            broad_counts = Counter(c.get('broadcaster') for c in clips)
+            stats = {
+                'total_clips': total_clips,
+                'top_streamers': broad_counts.most_common(3),
+            }
+        except Exception:
+            pass
+    return _no_cache(render_template('raport_kick_fragment.html', clips=clips, stats=stats, highlighted_streamers=highlighted_streamers))
+
+@app.route('/api/report-kick-status')
+def api_report_kick_status():
+    progress_default = {
+        'status': 'idle',
+        'total': 0,
+        'processed': 0,
+        'updated_at': None,
+    }
+    p = _safe_read_json(get_data_path('kick', 'progress.json'), progress_default)
+    return _no_cache(jsonify({'progress': p}))
+
+# --- ADMIN: force unlock Kick report + reset progress ---
+@app.route('/api/unlock-kick', methods=['POST'])
+def api_unlock_kick():
+    lock_path = get_data_path('kick', 'raport_kick.lock')
+    progress_path = get_data_path('kick', 'progress.json')
+    removed = False
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+            removed = True
+    except Exception:
+        pass
+    try:
+        _safe_write_json(progress_path, {
+            'status': 'idle',
+            'total': 0,
+            'processed': 0,
+            'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+    return _no_cache(jsonify({'ok': True, 'lock_removed': removed}))
+
+    
 
 # --- HEALTHCHECK -----------------------------------------
 @app.route('/health')
 def health():
-    twitch_ready = os.path.exists(get_data_path('raport.html'))
+    twitch_ready = os.path.exists(get_data_path('reports', 'twitch', 'raport.html'))
     kick_ready = os.path.exists(get_data_path('kick','raport_kick.html'))
 
     # rozszerzona diagnostyka środowiska i MoviePy
@@ -1856,21 +2792,30 @@ def api_ensure_cache_status():
 if __name__ == '__main__':
     # Flask app entrypoint
     try:
-        port = int(os.getenv('PORT', '5000'))
+        port = int(os.getenv('PORT', '5001'))
     except ValueError:
-        port = 5000
+        port = 5001
     host = os.getenv('HOST', '127.0.0.1')
     # Wymuszamy debug False
     debug = False
 
-    should_start_scheduler = True
+    # Kontrola uruchamiania harmonogramu przez ENV (domyślnie wyłączony)
+    should_start_scheduler = str(os.getenv('ENABLE_SCHEDULER', 'false')).lower() in ('1','true','yes','on')
     if should_start_scheduler:
         scheduler = BackgroundScheduler(timezone="UTC")
         scheduler.add_job(job_update_streamers, 'interval', minutes=30, id='update_streamers', replace_existing=True, coalesce=True, max_instances=1)
-        scheduler.add_job(job_generate_twitch_report, 'interval', minutes=60, id='generate_report', replace_existing=True, coalesce=True, max_instances=1)
+        # auto-odświeżanie raportu co 10 minut (spójne z frontendowym licznikiem)
+        scheduler.add_job(job_generate_twitch_report, 'interval', minutes=10, id='generate_report', replace_existing=True, coalesce=True, max_instances=1)
         scheduler.add_job(job_refresh_kick_and_report, 'interval', minutes=45, id='kick_refresh', replace_existing=True, coalesce=True, max_instances=1)
         scheduler.start()
+        # expose instance for /api/schedule-info
+        scheduler_instance = scheduler
         atexit.register(lambda: scheduler.shutdown(wait=False))
+    else:
+        try:
+            print('[scheduler] disabled (ENABLE_SCHEDULER not set to true)')
+        except Exception:
+            pass
 
     # Upewnij się, że Werkzeg nie oczekuje WERKZEUG_SERVER_FD
     try:

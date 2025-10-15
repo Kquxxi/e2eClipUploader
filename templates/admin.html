@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <title>Panel administracyjny – Preferencje streamerów</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ cache_buster }}">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Panel administracyjny</h1>
+      <div class="actions">
+        <a href="/" class="btn">⬅️ Powrót</a>
+        <button id="btn-save" class="btn">💾 Zapisz preferencje</button>
+        <span id="save-status" class="status"></span>
+      </div>
+    </header>
+
+    <main>
+      <section style="margin-top:12px;">
+        <h2>Wyróżnieni streamerzy</h2>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <input id="input-highlight" class="input" type="text" placeholder="Dodaj streamer (Twitch/Kick)">
+          <div id="suggest-highlight" class="suggest-box" style="display:none;"></div>
+          <button id="btn-add-highlight" class="btn">➕ Dodaj</button>
+        </div>
+        <div id="list-highlight" class="tag-list" style="margin-top:8px;"></div>
+      </section>
+
+      <section style="margin-top:20px;">
+        <h2>Pomijani streamerzy</h2>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <input id="input-skip" class="input" type="text" placeholder="Dodaj streamer (Twitch/Kick)">
+          <div id="suggest-skip" class="suggest-box" style="display:none;"></div>
+          <button id="btn-add-skip" class="btn">➕ Dodaj</button>
+        </div>
+        <div id="list-skip" class="tag-list" style="margin-top:8px;"></div>
+      </section>
+
+      <section style="margin-top:20px;">
+        <h2>Grupy tagów</h2>
+        <div style="display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap;">
+          <input id="input-tag-group-name" class="input" type="text" placeholder="Nazwa grupy (np. twitch, merghani)">
+          <input id="input-tag-group-tags" class="input" type="text" placeholder="Tagi rozdzielone przecinkami (np. #twitchshoty, #twitchklipy)">
+          <button id="btn-add-tag-group" class="btn">➕ Dodaj/Edytuj grupę</button>
+        </div>
+        <div id="list-tag-groups" class="tag-list" style="margin-top:8px;"></div>
+      </section>
+
+      <section style="margin-top:24px;">
+        <div class="hint">Zmiany działają od razu w raportach Twitch/Kick (bez regeneracji). Odśwież kartę raportu, aby zobaczyć efekt.</div>
+      </section>
+
+      <section style="margin-top:28px;">
+        <h2>Blokady raportów</h2>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <button id="btn-unlock-twitch" class="btn">🔓 Zdejmij blokadę Twitch + reset postępu</button>
+          <button id="btn-unlock-kick" class="btn">🔓 Zdejmij blokadę Kick + reset postępu</button>
+          <span id="unlock-status" class="status"></span>
+        </div>
+        <div class="hint">Użyj, jeśli generowanie utknęło (np. lock/progress). Zdejmuje lock i ustawia status na idle.</div>
+      </section>
+    </main>
+  </div>
+
+  <style>
+    .tag-list { display:flex; gap:8px; flex-wrap:wrap; }
+    .tag { background:#1f2530; color:#fff; padding:6px 10px; border-radius:16px; font-size:14px; display:inline-flex; align-items:center; gap:8px; border:1px solid #2e3746; }
+    .tag .remove { cursor:pointer; background:#2b3342; border:none; color:#fff; border-radius:12px; width:22px; height:22px; display:flex; align-items:center; justify-content:center; }
+    .input { padding:8px; border-radius:6px; border:1px solid #ccc; background:#fff; color:#333; min-width:240px; }
+    .suggest-box { position:absolute; background:#0f1217; border:1px solid #2e3746; border-radius:6px; padding:6px; max-height:220px; overflow:auto; z-index:1000; min-width:240px; box-shadow:0 8px 24px rgba(0,0,0,0.35); }
+    .suggest-item { padding:6px 8px; cursor:pointer; border-radius:4px; display:flex; justify-content:space-between; }
+    .suggest-item:hover { background:#1a1f29; }
+    .suggest-item .platform { color:#9aa4b2; font-size:12px; margin-left:12px; }
+  </style>
+
+  <script>
+    const state = {
+      highlighted: [],
+      skipped: [],
+      tags: {},
+      platforms: {},
+      tag_groups: {}
+    };
+
+    function renderTags(container, items){
+      container.innerHTML = '';
+      items.forEach(name=>{
+        const el = document.createElement('span');
+        el.className = 'tag';
+        el.innerHTML = `<span>${name}</span> <button class="remove" title="Usuń">✖</button>`;
+        el.querySelector('.remove').addEventListener('click', ()=>{
+          const arr = container.id.includes('highlight') ? state.highlighted : state.skipped;
+          const idx = arr.indexOf(name);
+          if (idx>=0){ arr.splice(idx,1); renderAll(); }
+        });
+        container.appendChild(el);
+      });
+    }
+
+    function renderTagGroups(container, groups){
+      container.innerHTML = '';
+      const entries = Object.entries(groups || {});
+      if (entries.length === 0){ container.innerHTML = '<span style="color:#888;">Brak grup</span>'; return; }
+      entries.forEach(([name, tags])=>{
+        const el = document.createElement('span');
+        el.className = 'tag';
+        const tagsText = Array.isArray(tags) ? tags.join(', ') : '';
+        el.innerHTML = `<span><strong>${name}</strong>: ${tagsText}</span> <button class="remove" title="Usuń">✖</button>`;
+        el.querySelector('.remove').addEventListener('click', ()=>{
+          delete state.tag_groups[name];
+          renderAll();
+        });
+        el.addEventListener('click', (ev)=>{
+          if (ev.target.classList.contains('remove')) return;
+          // Wypełnij pola edycji
+          document.getElementById('input-tag-group-name').value = name;
+          document.getElementById('input-tag-group-tags').value = (tags||[]).join(', ');
+        });
+        container.appendChild(el);
+      });
+    }
+
+    function renderAll(){
+      renderTags(document.getElementById('list-highlight'), state.highlighted);
+      renderTags(document.getElementById('list-skip'), state.skipped);
+      renderTagGroups(document.getElementById('list-tag-groups'), state.tag_groups);
+    }
+
+    async function loadPrefs(){
+      try{
+        const r = await fetch('/api/streamers-prefs');
+        const p = await r.json();
+        state.highlighted = Array.isArray(p.highlighted) ? p.highlighted.slice(0,500) : [];
+        state.skipped = Array.isArray(p.skipped) ? p.skipped.slice(0,500) : [];
+        state.tags = (p && typeof p.tags==='object') ? p.tags : {};
+        state.platforms = (p && typeof p.platforms==='object') ? p.platforms : {};
+        state.tag_groups = (p && typeof p.tag_groups==='object') ? p.tag_groups : {};
+        renderAll();
+      }catch(e){ console.error('prefs load failed', e); }
+    }
+
+    async function savePrefs(){
+      const btn = document.getElementById('btn-save');
+      btn.disabled = true;
+      document.getElementById('save-status').textContent = 'Zapisywanie…';
+      try{
+        const r = await fetch('/api/streamers-prefs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ highlighted: state.highlighted, skipped: state.skipped, tags: state.tags, platforms: state.platforms, tag_groups: state.tag_groups })
+        });
+        const j = await r.json();
+        document.getElementById('save-status').textContent = (j && j.ok) ? '✔️ Zapisano' : 'Błąd zapisu';
+      }catch(e){ document.getElementById('save-status').textContent = 'Błąd zapisu'; }
+      finally{ btn.disabled = false; setTimeout(()=>{ document.getElementById('save-status').textContent=''; }, 2000); }
+    }
+
+    function bindAdders(){
+      function bind(inputId, suggestId, targetArr){
+        const input = document.getElementById(inputId);
+        const box = document.getElementById(suggestId);
+        function hide(){ box.style.display='none'; box.innerHTML=''; }
+        function show(items){
+          if (!items.length){ hide(); return; }
+          box.style.display = 'block';
+          const rect = input.getBoundingClientRect();
+          box.style.position = 'absolute';
+          box.style.top = (window.scrollY + rect.bottom + 4) + 'px';
+          box.style.left = (window.scrollX + rect.left) + 'px';
+          box.style.minWidth = rect.width + 'px';
+          box.innerHTML = items.map(s=>`<div class="suggest-item" data-name="${s.name}"><span>${s.name}</span><span class="platform">${s.platform}</span></div>`).join('');
+          box.querySelectorAll('.suggest-item').forEach(el=>{
+            el.addEventListener('click', ()=>{
+              const name = el.dataset.name;
+              if (!targetArr.includes(name)) targetArr.push(name);
+              input.value = name; // zachowaj wybrany nick w polu, nie czyść
+              input.focus();
+              hide();
+              renderAll();
+            });
+          });
+        }
+        input.addEventListener('input', async ()=>{
+          const q = input.value.trim();
+          if (!q){ hide(); return; }
+          try{
+            const r = await fetch('/api/suggest-streamers?q=' + encodeURIComponent(q));
+            const j = await r.json();
+            const items = (j && Array.isArray(j.suggestions)) ? j.suggestions.slice(0, 12) : [];
+            show(items);
+          }catch{ hide(); }
+        });
+        input.addEventListener('blur', ()=> setTimeout(hide, 120));
+      }
+      bind('input-highlight', 'suggest-highlight', state.highlighted);
+      bind('input-skip', 'suggest-skip', state.skipped);
+    }
+
+    document.addEventListener('DOMContentLoaded', ()=>{
+      loadPrefs();
+      bindAdders();
+      document.getElementById('btn-add-highlight').addEventListener('click', ()=>{
+        const v = document.getElementById('input-highlight').value.trim();
+        if (v && !state.highlighted.includes(v)){ state.highlighted.push(v); document.getElementById('input-highlight').value=''; renderAll(); }
+      });
+      document.getElementById('btn-add-skip').addEventListener('click', ()=>{
+        const v = document.getElementById('input-skip').value.trim();
+        if (v && !state.skipped.includes(v)){ state.skipped.push(v); document.getElementById('input-skip').value=''; renderAll(); }
+      });
+      document.getElementById('btn-add-tag-group').addEventListener('click', ()=>{
+        const nameRaw = document.getElementById('input-tag-group-name').value.trim();
+        const tagsRaw = document.getElementById('input-tag-group-tags').value.trim();
+        if (!nameRaw){ return; }
+        const name = nameRaw.toLowerCase();
+        const tags = tagsRaw ? tagsRaw.split(',').map(s=>s.trim()).filter(Boolean) : [];
+        // Normalizacja: dodaj # jeśli brak
+        const norm = [];
+        const seen = new Set();
+        tags.forEach(t=>{
+          let x = t.startsWith('#') ? t : ('#' + t);
+          const k = x.toLowerCase();
+          if (seen.has(k)) return; seen.add(k); norm.push(x);
+        });
+        state.tag_groups[name] = norm;
+        document.getElementById('input-tag-group-name').value = '';
+        document.getElementById('input-tag-group-tags').value = '';
+        renderAll();
+      });
+      document.getElementById('btn-save').addEventListener('click', savePrefs);
+
+      async function doUnlock(kind){
+        const btnT = document.getElementById('btn-unlock-twitch');
+        const btnK = document.getElementById('btn-unlock-kick');
+        const status = document.getElementById('unlock-status');
+        const url = kind === 'kick' ? '/api/unlock-kick' : '/api/unlock-twitch';
+        (kind==='kick' ? btnK : btnT).disabled = true;
+        status.textContent = 'Zdejmowanie blokady…';
+        try{
+          const r = await fetch(url, { method: 'POST' });
+          const j = await r.json();
+          if (j && j.ok){
+            status.textContent = (j.lock_removed ? '✔️ Zdjęto lock, zresetowano postęp' : '✔️ Brak locka, zresetowano postęp');
+          } else {
+            status.textContent = 'Błąd zdejmowania blokady';
+          }
+        }catch(e){ status.textContent = 'Błąd sieci'; }
+        finally{
+          (kind==='kick' ? btnK : btnT).disabled = false;
+          setTimeout(()=>{ status.textContent=''; }, 2500);
+        }
+      }
+      document.getElementById('btn-unlock-twitch').addEventListener('click', ()=> doUnlock('twitch'));
+      document.getElementById('btn-unlock-kick').addEventListener('click', ()=> doUnlock('kick'));
+    });
+  </script>
+  </body>
+  </html>

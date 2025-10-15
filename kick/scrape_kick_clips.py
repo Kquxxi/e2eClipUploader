@@ -44,7 +44,8 @@ if not db_file:
     else:
         db_file = os.path.join(base, 'kick_database.json')
 
-with open(db_file, encoding='utf-8') as f:
+# Wczytaj bazę streamerów bezpiecznie (obsługa BOM)
+with open(db_file, encoding='utf-8-sig') as f:
     streamers = json.load(f)['database']
 
 now = datetime.now(timezone.utc)
@@ -53,8 +54,13 @@ day_ago = now - timedelta(hours=KICK_WINDOW_HOURS)
 # --- Wczytaj stare klipy (jeśli plik istnieje)
 cache_path = get_data_path('kick', 'kick_clips_cache.json')
 if os.path.exists(cache_path):
-    with open(cache_path, encoding='utf-8') as f:
-        old_clips = json.load(f)
+    try:
+        # Wczytaj cache klipów z tolerancją na BOM
+        with open(cache_path, encoding='utf-8-sig') as f:
+            old_clips = json.load(f)
+    except Exception as e:
+        print(f"[kick] cache read failed ({e}); using empty list")
+        old_clips = []
 else:
     old_clips = []
 
